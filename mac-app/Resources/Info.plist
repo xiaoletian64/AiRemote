@@ -11,11 +11,10 @@
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
-  <key>NSBluetoothAlwaysUsageDescription</key><string>连接小米遥控器接收按键与语音 / Connect Mi Remote for buttons & voice</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>连接小米遥控器接收按键与语音 / Connect Mi Remote for buttons &amp; voice</string>
   <key>NSInputMonitoringUsageDescription</key><string>读取遥控器按键以进行映射 / Read remote buttons for remapping</string>
   <key>NSMicrophoneUsageDescription</key><string>把遥控器语音作为系统麦克风 / Stream remote voice as system microphone</string>
   <key>NSAppleEventsUsageDescription</key><string>向前台 App 发送按键合成事件 / Send synthetic key events to frontmost app</string>
-  <key>SUFeedURL</key><string>https://github.com/你的用户名/AiRemote/releases/latest/download/appcast.xml</string>
   <key>CFBundleSpokenName</key><string>小米 Vibecoding 键盘</string>
   <key>ITSAppUsesNonExemptEncryption</key><false/>
 </dict></plist>

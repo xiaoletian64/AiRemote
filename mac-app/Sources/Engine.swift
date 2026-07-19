@@ -128,9 +128,13 @@ final class Engine: ObservableObject {
     @Published var remoteConnected = false
     @Published var handshakeReady = false
     @Published var blackholeFound = false
+    @Published var blackholeSelectedAsInput = false
     @Published var axTrusted = false
     @Published var inputMonitoringOK = false
     @Published var micStreaming = false
+    @Published var voicePacketCount = 0
+    @Published var voiceBytesReceived = 0
+    @Published var voiceFailure = ""
     @Published var lastButton = ""            // last raw button seen (for Learn)
     @Published var lastButtonUsage: Int = 0
     @Published var capturingUsage: Int? = nil // which button is currently recording a key (-1 = voice)
@@ -139,14 +143,21 @@ final class Engine: ObservableObject {
     @Published var scanning = false
     @Published var lastFoundName: String? = nil
     @Published var lastRSSI: Int = 0
+    // 前台弹窗用：最新按键事件显示 + 触发抖动 token
+    @Published var lastKeyLabel: String = "—"
+    @Published var lastKeyMapping: String = ""
+    @Published var lastKeyAtMs: TimeInterval = 0
+    @Published var keyFlash: Int = 0
 
-    var config = ConfigStore.load()
+    @Published var config = ConfigStore.load()
 
     private let ring = Ring(16000 * 4)
     private var codec = ADPCM()
     private var dsp = VoiceDSP()
     private let engine = AVAudioEngine()
     private var srcNode: AVAudioSourceNode!
+    private let voiceGlobeMapper = VoiceGlobeMapper()
+    @Published var hardwareGlobeReady = false
 
     // BLE
     private var cm: CBCentralManager!
@@ -154,6 +165,7 @@ final class Engine: ObservableObject {
     private var tx: CBCharacteristic?
     private var capsSent = false
     private var streaming = false
+    private var lastVoicePacketAt: TimeInterval = 0
 
     // HID
     private var hidMgr: IOHIDManager?
@@ -162,11 +174,15 @@ final class Engine: ObservableObject {
     private var voiceHidDown = false   // 语音键的 HID F5 正被按住（需持续吞掉）
     private var downButtonUsage: Int = 0
     private var downTarget: ButtonMapping?
+    private var longPressTimer: Timer?
+    private var deleteRepeatTimer: Timer?
+    private var longPressFired = false
     private var keyMonitor: Any?
 
     // event tap
     private var tap: CFMachPort?
-    private var proxy: BTProxy!
+    private var proxy: BTProxy!   // 强引用，避免被释放导致委托丢失
+    private var btProxyRef: BTProxy?  // 额外持有，防止 weak 丢失
 
     private let ATVV = CBUUID(string: "AB5E0001-5A21-4F05-BC7D-AF01F617B664")
     private let TX = CBUUID(string: "AB5E0002-5A21-4F05-BC7D-AF01F617B664")
@@ -176,9 +192,15 @@ final class Engine: ObservableObject {
                         CBUUID(string:"AB5E0001-5A21-4F05-BC7D-AF01F617B664")]
 
     static let logFile: FileHandle? = {
-        let p = (NSHomeDirectory() as NSString).appendingPathComponent("Desktop/mivibeboard.log")
-        FileManager.default.createFile(atPath: p, contents: nil)
-        return FileHandle(forWritingAtPath: p)
+        let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs/MiVibeBoard", isDirectory: true)
+        try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let url = logs.appendingPathComponent("mivibeboard.log")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: url) else { return nil }
+        try? handle.truncate(atOffset: 0)
+        try? handle.seek(toOffset: 0)
+        return handle
     }()
     func L(_ s: String) {
         NSLog("[MiVibeBoard] %@", s)
@@ -187,25 +209,63 @@ final class Engine: ObservableObject {
     }
 
     // ---------- lifecycle ----------
-    func start() {
+    private var started = false
+    func start() { startIfNeeded() }
+    func startIfNeeded() {
+        guard !started else { return }
+        started = true
         proxy = BTProxy(self)
-        ConfigStore.save(config)   // persist merged button list (power/menu/TV/volume)
-        setupAudio()
+        btProxyRef = proxy   // 额外强引用
+        ConfigStore.save(config)
+        L("语音键映射: \(config.voice.display)")
+        applyVoiceGlobeMapping()
+
         checkPermissions()
+        L("权限状态: 辅助功能=\(axTrusted ? "已授权" : "未授权"), 输入监控=\(inputMonitoringOK ? "已授权" : "未授权")")
+
+        // BLE 初始化
         cm = CBCentralManager(delegate: proxy, queue: nil)
-        installTap()
-        setupHID()
-        installKeyCapture()
-        // 守护定时器：① 授权后自动补装事件拦截；② 输出设备脱离 BlackHole 时自动重挂
-        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+
+        // HID 和音频等权限到位后再做，定时器会重试
+        Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
-                self.audioWatchdog()
-                if self.tap == nil, AXIsProcessTrusted() {
-                    self.installTap()
-                    if self.tap != nil { self.L("辅助功能已授权，事件拦截已启用") }
+                // 权限就绪前不做任何"报错"日志
+                if AXIsProcessTrusted() && !self.axTrusted { self.axTrusted = true; self.L("✅ 辅助功能已授权") }
+                let imOK = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+                if imOK && !self.inputMonitoringOK { self.inputMonitoringOK = true; self.L("✅ 输入监控已授权") }
+
+                if self.axTrusted && self.tap == nil { self.installTap() }
+                if self.inputMonitoringOK && self.hidMgr == nil { self.setupHID() }
+                if self.axTrusted && self.keyMonitor == nil { self.installKeyCapture() }
+                if !self.hardwareGlobeReady { self.applyVoiceGlobeMapping() }
+
+                // 启动音频（只需一次）
+                if self.srcNode == nil {
+                    self.setupAudio()
+                } else {
+                    self.audioWatchdog()
                 }
             }
+        }
+    }
+
+    func stop() {
+        longPressTimer?.invalidate(); deleteRepeatTimer?.invalidate(); specialTimer?.invalidate()
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
+        voiceGlobeMapper.restore()
+        hardwareGlobeReady = false
+        L("已恢复遥控器原始语音键映射")
+    }
+
+    private func applyVoiceGlobeMapping() {
+        let applied = voiceGlobeMapper.apply()
+        if applied != hardwareGlobeReady {
+            hardwareGlobeReady = applied
+            L(applied
+                ? "✅ 语音键硬件映射已启用：F5 → Apple Globe/Fn"
+                : "等待小米遥控器 HID 服务，以启用硬件 Globe/Fn 映射")
         }
     }
 
@@ -213,15 +273,17 @@ final class Engine: ObservableObject {
     func beginCapture(usage: Int) { capturingUsage = usage; L("请在键盘上按下要映射的键…") }
     func cancelCapture() { capturingUsage = nil }
     func clearMapping(usage: Int) {
-        if usage == -1 { config.voice.keycode = KeyNames.kNone; config.voice.cmd = false; config.voice.shift = false; config.voice.opt = false; config.voice.ctrl = false }
+        if usage == -1 { config.voice.keycode = KeyNames.kNone; config.voice.cmd = false; config.voice.shift = false; config.voice.opt = false; config.voice.ctrl = false; config.voice.longPressKeycode = nil }
         else if let i = config.buttons.firstIndex(where: { $0.usage == usage }) {
             config.buttons[i].keycode = KeyNames.kNone; config.buttons[i].cmd = false
             config.buttons[i].shift = false; config.buttons[i].opt = false; config.buttons[i].ctrl = false
+            config.buttons[i].longPressKeycode = nil
         }
         saveConfig()
     }
     private var pendingCaptureMod: UInt16? = nil   // 录制中按住的修饰键（等松开或组合普通键）
     private func installKeyCapture() {
+        guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] ev in
             guard let self = self, self.capturingUsage != nil else { return ev }
             let loneMods: Set<UInt16> = [0x36,0x37,0x38,0x3C,0x3A,0x3D,0x3B,0x3E,0x39,0x3F]
@@ -291,13 +353,57 @@ final class Engine: ObservableObject {
 
     func checkPermissions() {
         axTrusted = AXIsProcessTrusted()
-        blackholeFound = (Self.deviceID(named: "BlackHole") != nil)
         inputMonitoringOK = (IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted)
+        checkBlackHole()
     }
+    func checkBlackHole() {
+        let was = blackholeFound
+        let device = Self.deviceID(named: "BlackHole")
+        blackholeFound = (device != nil)
+        blackholeSelectedAsInput = device.map { Self.defaultInputDevice() == $0 } ?? false
+        // 只在状态变化时记日志，避免刷屏
+        if blackholeFound && !was {
+            L("✅ BlackHole 声卡已就绪 (设备 \(device?.description ?? "?"))")
+            selectBlackHoleAsSystemInput()
+        }
+        else if !blackholeFound && !was { L("⚠️ BlackHole 未检测到；语音不会送入系统输入") }
+    }
+
+    /// The app produces audio into BlackHole, so selecting it as the system input is
+    /// required for Dictation and input methods to receive the remote microphone.
+    func selectBlackHoleAsSystemInput() {
+        guard let device = Self.deviceID(named: "BlackHole") else {
+            L("⚠️ 无法选择 BlackHole：CoreAudio 尚未枚举该设备。安装驱动后请重启 Mac。")
+            blackholeSelectedAsInput = false
+            return
+        }
+        var selected = device
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil,
+                                                UInt32(MemoryLayout<AudioDeviceID>.size), &selected)
+        blackholeSelectedAsInput = status == noErr && Self.defaultInputDevice() == device
+        L(blackholeSelectedAsInput ? "✅ 已自动选择 BlackHole 为系统输入" : "⚠️ BlackHole 已检测到，但设为系统输入失败 (OSStatus \(status))")
+    }
+    /// Each TCC permission is requested only from its explicit UI button.  Repeated
+    /// automatic prompts are noisy and macOS ignores them after the first denial.
     func requestAX() {
-        _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+        if !AXIsProcessTrusted() {
+            let _ = AXIsProcessTrustedWithOptions(
+                [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+            L("📌 请在弹窗中点击「打开系统设置」，勾选本 App")
+        }
+        checkPermissions()
     }
-    func requestInputMonitoring() { _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent) }
+    func requestInputMonitoring() {
+        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+            IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+            L("📌 已请求输入监控权限；请在系统设置中允许本 App")
+        }
+        checkPermissions()
+    }
     func openAXSettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
@@ -306,25 +412,41 @@ final class Engine: ObservableObject {
     }
 
     // ---------- audio ----------
+    private var audioSetupDone = false
     private func setupAudio() {
-        let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
-        srcNode = AVAudioSourceNode(format: fmt) { [ring] _, _, frames, abl in
-            let l = UnsafeMutableAudioBufferListPointer(abl)
-            if let m = l[0].mData { ring.pop(m.assumingMemoryBound(to: Float.self), Int(frames)) }
-            return noErr
+        guard !audioSetupDone else { return }
+        audioSetupDone = true
+        checkBlackHole()
+        if !blackholeFound {
+            L("⚠️ 未找到 BlackHole。请安装 BlackHole 2ch 并在系统声音输入中选中它；App 不会自动请求管理员权限安装驱动。")
         }
-        engine.attach(srcNode)
-        engine.connect(srcNode, to: engine.mainMixerNode, format: fmt)
-        // 输出设备必须在节点接线完成之后再切到 BlackHole：
-        // 访问 mainMixerNode 会重建输出单元并把设备重置回系统默认，之前设置的会被覆盖
-        setOutputDevice()
-        engine.prepare()
-        do { try engine.start() } catch { L("音频引擎启动失败: \(error)") }
-        verifyOutputDevice()
-        // 设备配置变化（显示器休眠/重连、采样率切换等）会让引擎重建并重置回默认输出，必须重新挂载
+        // 持续监控：检测到 BlackHole 出现后挂上
         NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.audioWatchdog(reason: "配置变化通知") }
         }
+        rebuildAudio()
+    }
+    /// 重建音频图并挂到 BlackHole
+    private func rebuildAudio() {
+        // 防止空 fmt 重建
+        if srcNode == nil {
+            let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+            srcNode = AVAudioSourceNode(format: fmt) { [ring] _, _, frames, abl in
+                let l = UnsafeMutableAudioBufferListPointer(abl)
+                if let m = l[0].mData { ring.pop(m.assumingMemoryBound(to: Float.self), Int(frames)) }
+                return noErr
+            }
+            engine.attach(srcNode)
+            engine.connect(srcNode, to: engine.mainMixerNode, format: fmt)
+            engine.prepare()
+            do { try engine.start() } catch { L("音频引擎启动失败: \(error)") }
+        }
+        setOutputDevice()
+        engine.prepare()
+        if !engine.isRunning {
+            do { try engine.start() } catch { L("音频引擎启动失败: \(error)") }
+        }
+        verifyOutputDevice()
     }
     func audioWatchdog(reason: String = "定时检查") {
         guard let bh = Self.deviceID(named: "BlackHole"), let u = engine.outputNode.audioUnit else { return }
@@ -379,38 +501,61 @@ final class Engine: ObservableObject {
         }
         return nil
     }
+    static func defaultInputDevice() -> AudioDeviceID? {
+        var device: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+        return status == noErr && device != 0 ? device : nil
+    }
 
     // ---------- BLE (ATVV voice + mic) ----------
     fileprivate func btStateChanged(_ c: CBCentralManager) {
+        let stMap: [CBManagerState: String] = [.unknown:"unknown", .resetting:"resetting", .unsupported:"unsupported", .unauthorized:"unauthorized", .poweredOff:"poweredOff", .poweredOn:"poweredOn"]
+        let old = btOn
         btOn = (c.state == .poweredOn)
-        if btOn { startSearching() }
+        L("🔵 蓝牙状态: \(stMap[c.state] ?? "?")")
+        if !old && btOn {
+            L("🔵 蓝牙已开，启动搜索")
+            startSearching()
+        } else if c.state == .unauthorized {
+            L("⚠️ 蓝牙未授权，请在系统设置→隐私与安全→蓝牙 中允许本 App")
+        }
     }
     func startSearching() {
         guard let c = cm, c.state == .poweredOn else { return }
-        // 1) 优先看是否已在系统蓝牙里配对过（不需要重扫）
-        if let d = c.retrieveConnectedPeripherals(withServices: seed).first {
-            dev = d; d.delegate = proxy; capsSent = false; c.connect(d, options: nil)
-            L("🔗 已连接系统配对的遥控器: \(d.name ?? "?")")
-            return
+        // 1) 优先看是否已在系统蓝牙里配对过（按多个服务 UUID 逐个 try）
+        //    小米遥控器配对后会与系统持有 HID(0x1812)/Battery(0x180F) 持续连接
+        for svc in seed {
+            if let d = c.retrieveConnectedPeripherals(withServices: [svc]).first {
+                dev = d; d.delegate = proxy; capsSent = false; c.connect(d, options: nil)
+                L("🔗 已连接系统配对的遥控器: \(d.name ?? "?") (via service \(svc.uuidString))")
+                return
+            }
         }
         // 2) 否则主动扫描，按名字匹配
         if !scanning {
             scanning = true
             lastFoundName = nil
-            c.scanForPeripherals(withServices: nil, options: [
-                CBCentralManagerScanOptionAllowDuplicatesKey: false,
-                CBCentralManagerScanOptionSolicitedServiceUUIDsKey: seed
-            ])
+            c.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
             L("🎧 正在扫描小米蓝牙语音遥控器…")
             L("💡 提示：长按遥控器【主页+菜单】5秒，指示灯快闪即进入配对模式")
             // 30 秒内没找到就停止扫描
             DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
                 guard let s = self, s.scanning else { return }
-                s.cm.stopScan(); s.scanning = false
+                s.cm?.stopScan(); s.scanning = false
                 s.L("⚠️ 30 秒内未发现遥控器，将在 3 秒后重试。")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.startSearching() }
             }
         }
+    }
+    // 防御性：连接失败也重连
+    func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
+        L("⚠️ 连接失败: \(error?.localizedDescription ?? "?")，3 秒后重试。")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.startSearching() }
     }
     func retryScan() { startSearching() }
     fileprivate func didDiscover(_ p: CBPeripheral, rssi: Int) {
@@ -437,16 +582,48 @@ final class Engine: ObservableObject {
         }
     }
     fileprivate func didNotify(_ p: CBPeripheral, _ ch: CBCharacteristic) {
-        if ch.uuid == CTL && ch.isNotifying && !capsSent, let tx = tx {
-            capsSent = true
-            p.writeValue(Data([0x0A,0x00,0x06,0x00,0x01]), for: tx, type: .withResponse)
-            handshakeReady = true; L("语音握手完成，随时可用")
+        if ch.uuid == CTL && ch.isNotifying && !capsSent {
+            sendATVVCaps(force: false)
         }
+    }
+    fileprivate func didWrite(_ p: CBPeripheral, _ ch: CBCharacteristic, error: Error?) {
+        guard ch.uuid == TX else { return }
+        if let error {
+            handshakeReady = false
+            voiceFailure = "ATVV 握手写入失败：\(error.localizedDescription)"
+            L("❌ \(voiceFailure)")
+        } else {
+            handshakeReady = true
+            voiceFailure = ""
+            L("✅ ATVV 语音握手已确认")
+        }
+    }
+    private func sendATVVCaps(force: Bool) {
+        guard let p = dev, let tx else {
+            voiceFailure = "未找到 ATVV 命令通道"
+            L("❌ \(voiceFailure)")
+            return
+        }
+        guard force || !capsSent else { return }
+        capsSent = true
+        handshakeReady = false
+        p.writeValue(Data([0x0A,0x00,0x06,0x00,0x01]), for: tx, type: .withResponse)
+        L("→ 正在请求 ATVV 语音能力…")
     }
     fileprivate func didValue(_ p: CBPeripheral, _ ch: CBCharacteristic) {
         guard let d = ch.value else { return }
         if ch.uuid == RX {
-            if streaming { ring.push(dsp.process(codec.decode(d))) }
+            if streaming {
+                voicePacketCount += 1
+                voiceBytesReceived += d.count
+                lastVoicePacketAt = ProcessInfo.processInfo.systemUptime
+                voiceFailure = ""
+                if voicePacketCount == 1 {
+                    L("✅ 已收到首个 ATVV 音频帧（\(d.count) bytes），正在解码并转发")
+                }
+                let pcm = dsp.process(codec.decode(d))
+                if micStreaming { ring.push(pcm) }
+            }
         } else if ch.uuid == CTL, let f = d.first {
             if f == 0x04 { voiceButton(down: true) }
             else if f == 0x00 { voiceButton(down: false) }
@@ -458,81 +635,182 @@ final class Engine: ObservableObject {
         voiceHidDown = down
         lastHidKeycodeAt[HIDMap.voiceKeycode] = ProcessInfo.processInfo.systemUptime
         if down {
-            codec.reset(); dsp.reset(); streaming = true; micStreaming = config.voiceStartsMic
+            if blackholeFound && !blackholeSelectedAsInput { selectBlackHoleAsSystemInput() }
+            codec.reset(); dsp.reset(); streaming = true
+            micStreaming = config.voiceStartsMic && blackholeFound && blackholeSelectedAsInput
+            voicePacketCount = 0; voiceBytesReceived = 0; voiceFailure = ""
             if v.keycode >= KeyNames.kSpecialBase { startSpecial(v.keycode) }
-            else if v.keycode != KeyNames.kNone { postKey(CGKeyCode(v.keycode), down: true, cmd: v.cmd, shift: v.shift, opt: v.opt, ctrl: v.ctrl) }
-            L("🎤 语音键按下 → \(v.display)\(config.voiceStartsMic ? " + 麦克风开" : "")")
+            // The remote's own F5 is now an actual Apple Globe/Fn HID event.
+            // Never add a synthetic Fn on top of it: WeChat IME rejects that
+            // synthetic event and it would also create duplicate transitions.
+            else if v.keycode != 0x3F && v.keycode != KeyNames.kNone { postKey(CGKeyCode(v.keycode), down: true, cmd: v.cmd, shift: v.shift, opt: v.opt, ctrl: v.ctrl) }
+            if !handshakeReady {
+                voiceFailure = "ATVV 尚未握手完成"
+                sendATVVCaps(force: true)
+            } else if config.voiceStartsMic && !micStreaming {
+                voiceFailure = "BlackHole 未就绪，音频只做接收诊断，不会转发"
+            }
+            L("🎤 语音键按下 → \(v.display)\(micStreaming ? " + 麦克风转发" : "")")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self, self.streaming, self.voicePacketCount == 0 else { return }
+                self.voiceFailure = "未收到音频帧，正在重试 ATVV 握手"
+                self.L("⚠️ \(self.voiceFailure)")
+                self.sendATVVCaps(force: true)
+            }
         } else {
             streaming = false; micStreaming = false
             if v.keycode >= KeyNames.kSpecialBase { stopSpecial(v.keycode) }
-            else if v.keycode != KeyNames.kNone { postKey(CGKeyCode(v.keycode), down: false, cmd: false) }
+            else if v.keycode != 0x3F && v.keycode != KeyNames.kNone { postKey(CGKeyCode(v.keycode), down: false, cmd: false) }
             L("语音键松开")
         }
     }
 
     // ---------- HID reading ----------
     private func setupHID() {
+        guard hidMgr == nil else { return }
+        guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else { return }
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, 0)
         IOHIDManagerSetDeviceMatching(mgr, [kIOHIDVendorIDKey: 0x2717] as CFDictionary)
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
-        _ = IOHIDManagerOpen(mgr, 0)
-        if let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice> {
-            inputMonitoringOK = !set.isEmpty
-            for dvc in set {
-                let rsize = (IOHIDDeviceGetProperty(dvc, kIOHIDMaxInputReportSizeKey as CFString) as? Int) ?? 64
-                _ = IOHIDDeviceOpen(dvc, IOHIDOptionsType(kIOHIDOptionsTypeNone))
-                let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: max(rsize,8)); hidBufs.append(buf)
-                let ctx = Unmanaged.passUnretained(self).toOpaque()
-                IOHIDDeviceRegisterInputReportCallback(dvc, buf, max(rsize,8), { context, _, _, _, _, report, len in
-                    guard let context = context, len >= 4 else { return }
-                    let me = Unmanaged<Engine>.fromOpaque(context).takeUnretainedValue()
-                    let usage = report[3]
-                    // 回调本就在主运行循环上，必须同步处理：
-                    // 若 async 延后一拍，系统生成的原生键事件会抢先到达拦截器，抑制标记来不及生效
-                    MainActor.assumeIsolated { me.hidReport(usage: usage) }
-                }, ctx)
-                IOHIDDeviceScheduleWithRunLoop(dvc, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
-            }
+        let openRes = IOHIDManagerOpen(mgr, 0)
+        guard openRes == kIOReturnSuccess else {
+            L("⚠️ IOHIDManagerOpen 失败: \(openRes)（输入监控权限未授权？）")
+            return
+        }
+        guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
+            L("⚠️ IOHID 未发现小米遥控器（Vendor 0x2717），稍后自动重试")
+            // 没找到设备时不持久化 hidMgr，让定时器可以重试
+            return
+        }
+        inputMonitoringOK = true
+        L("✅ HID 找到 \(set.count) 个小米设备")
+        for dvc in set {
+            let rsize = (IOHIDDeviceGetProperty(dvc, kIOHIDMaxInputReportSizeKey as CFString) as? Int) ?? 64
+            _ = IOHIDDeviceOpen(dvc, IOHIDOptionsType(kIOHIDOptionsTypeNone))
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: max(rsize,8)); hidBufs.append(buf)
+            let ctx = Unmanaged.passUnretained(self).toOpaque()
+            IOHIDDeviceRegisterInputReportCallback(dvc, buf, max(rsize,8), { context, _, _, _, _, report, len in
+                guard let context = context, len > 0 else { return }
+                let me = Unmanaged<Engine>.fromOpaque(context).takeUnretainedValue()
+                let bytes = Array(UnsafeBufferPointer(start: report, count: Int(len)))
+                MainActor.assumeIsolated { me.handleHIDReport(bytes) }
+            }, ctx)
+            IOHIDDeviceScheduleWithRunLoop(dvc, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
         }
         hidMgr = mgr
+        if hidMgr != nil { flashKey(label: "✓ 遥控器就绪", mapping: "可以开始按键") }
+    }
+
+    /// Xiaomi remotes expose slightly different HID report layouts by model.  Rather
+    /// than relying on one fixed byte offset, find known usages anywhere in a report.
+    /// A report containing no known usage is the release report for the active key.
+    private func handleHIDReport(_ bytes: [UInt8]) {
+        let known = Set(config.buttons.map { UInt8(truncatingIfNeeded: $0.usage) } + [HIDMap.voiceUsage])
+        let candidates = bytes.filter { known.contains($0) && $0 != 0 }
+        if let usage = candidates.last {
+            hidReport(usage: usage)
+        } else if bytes.allSatisfy({ $0 == 0 }) || (bytes.count > 1 && bytes.dropFirst().allSatisfy({ $0 == 0 })) {
+            hidReport(usage: 0)
+        } else {
+            let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+            L("未识别的 HID 报告: \(hex)")
+        }
     }
 
     private func hidReport(usage: UInt8) {
         let now = ProcessInfo.processInfo.systemUptime
         if usage == 0x00 {
-            // release: send keyUp for the held mapped target, if any
+            longPressTimer?.invalidate(); longPressTimer = nil
+            deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
             if voiceHidDown { voiceHidDown = false; lastHidKeycodeAt[HIDMap.voiceKeycode] = now }
             if let t = downTarget {
-                if t.keycode >= KeyNames.kSpecialBase { stopSpecial(t.keycode) }
+                if t.longPressKeycode != nil {
+                    if !longPressFired { tapMapping(t) }
+                } else if t.keycode >= KeyNames.kSpecialBase { stopSpecial(t.keycode) }
                 else if t.keycode != KeyNames.kNone { postKey(CGKeyCode(t.keycode), down: false, cmd: false) }
             }
-            downButtonUsage = 0; downTarget = nil
+            downButtonUsage = 0; downTarget = nil; longPressFired = false
             return
         }
         if usage == HIDMap.voiceUsage {
-            // 语音键的原生 F5：吞掉（BLE 通道已负责发所录制的键），避免触发系统听写
             voiceHidDown = true
             lastHidKeycodeAt[HIDMap.voiceKeycode] = now
             return
         }
-        // a button is pressed
+        // HID keeps emitting the same key-down report while a key is held.  Synthesize
+        // one key-down only; the all-zero report below is responsible for key-up.
+        if downButtonUsage == Int(usage) { return }
         lastButtonUsage = Int(usage)
         lastButton = String(format: "0x%02x", usage)
-        // mark for suppression if macOS will also generate a keycode
         if let kc = HIDMap.usageToKeycode[usage] { lastHidKeycodeAt[kc] = now }
-        // find mapping
         guard let m = config.buttons.first(where: { $0.usage == Int(usage) }) else {
-            L(String(format: "按键 0x%02x 未在映射表中（保持原样）", usage))
+            let msg = String(format: "按键 0x%02x 未在映射表中（保持原样）", usage)
+            L(msg)
+            self.flashKey(label: String(format: "0x%02x", usage), mapping: "未映射")
             return
         }
-        L(String(format: "按键 0x%02x [%@] → %@", usage, m.name, m.display))
-        if m.keycode == KeyNames.kNone { downButtonUsage = Int(usage); downTarget = nil; return } // keep original
-        if m.keycode >= KeyNames.kSpecialBase {   // 鼠标/滚轮：按住持续，松开停止
+        let msg = String(format: "0x%02x [%@] → %@", usage, m.name, m.display)
+        L(msg)
+        self.flashKey(label: m.name, mapping: m.display)
+        if m.keycode == KeyNames.kNone { downButtonUsage = Int(usage); downTarget = nil; return }
+        if let long = m.longPressKeycode {
+            downButtonUsage = Int(usage); downTarget = m; longPressFired = false
+            longPressTimer?.invalidate()
+            longPressTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self = self, self.downButtonUsage == Int(usage) else { return }
+                    self.longPressFired = true
+                    self.trigger(keycode: long, mapping: m, down: true)
+                    self.flashKey(label: "长按 \(m.name)", mapping: KeyNames.label(keycode: long, cmd: false, shift: false, opt: false, ctrl: false))
+                }
+            }
+            return
+        }
+        if m.keycode >= KeyNames.kSpecialBase {
             startSpecial(m.keycode); downButtonUsage = Int(usage); downTarget = m; return
         }
-        // emit mapped key (down); keyUp on release
         postKey(CGKeyCode(m.keycode), down: true, cmd: m.cmd, shift: m.shift, opt: m.opt, ctrl: m.ctrl)
+        if Int(usage) == 0xF1 && m.keycode == 0x33 { startDeleteRepeat() }
         downButtonUsage = Int(usage); downTarget = m
+    }
+
+    private func tapMapping(_ mapping: ButtonMapping) {
+        trigger(keycode: mapping.keycode, mapping: mapping, down: true)
+        if mapping.keycode < KeyNames.kSpecialBase && mapping.keycode != KeyNames.kNone {
+            postKey(CGKeyCode(mapping.keycode), down: false, cmd: false)
+        }
+    }
+
+    private func trigger(keycode: Int, mapping: ButtonMapping, down: Bool) {
+        if keycode >= KeyNames.kSpecialBase { if down { startSpecial(keycode) } else { stopSpecial(keycode) } }
+        else if keycode != KeyNames.kNone { postKey(CGKeyCode(keycode), down: down, cmd: mapping.cmd, shift: mapping.shift, opt: mapping.opt, ctrl: mapping.ctrl) }
+    }
+
+    private func startDeleteRepeat() {
+        deleteRepeatTimer?.invalidate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            guard let self = self, self.downButtonUsage == 0xF1 else { return }
+            self.deleteRepeatTimer = Timer.scheduledTimer(withTimeInterval: 0.07, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self = self, self.downButtonUsage == 0xF1 else { return }
+                    self.postKey(0x33, down: true, cmd: false)
+                    self.postKey(0x33, down: false, cmd: false)
+                }
+            }
+        }
+    }
+
+    /// 触发前台大字弹窗：刷新 label / mapping / token，UI 监听 keyFlash 来做动画
+    private func flashKey(label: String, mapping: String) {
+        lastKeyLabel = label
+        lastKeyMapping = mapping
+        lastKeyAtMs = Date().timeIntervalSince1970
+        keyFlash &+= 1
+    }
+
+    private func showNotification(title: String, body: String) {
+        // 旧通知 API 已废弃，全部走前台弹窗 flashKey
+        flashKey(label: title, mapping: body)
     }
 
     // ---------- CGEvent tap: suppress originals of mapped buttons ----------
@@ -569,9 +847,12 @@ final class Engine: ObservableObject {
         var suppress = false
         MainActor.assumeIsolated {
             let now = ProcessInfo.processInfo.systemUptime
-            // 语音键的 F5：按住期间全部吞掉（含自动重复），松开后 120ms 内吞掉 keyUp
+            // With the device-level mapping active, F5 has become the genuine
+            // Apple Globe/Fn HID event and must reach the input method.  Until
+            // the mapping becomes available, keep swallowing F5 so it cannot
+            // trigger macOS's native dictation shortcut.
             if kc == HIDMap.voiceKeycode {
-                suppress = voiceHidDown || (lastHidKeycodeAt[kc].map { now - $0 < 0.12 } ?? false)
+                suppress = !hardwareGlobeReady && (voiceHidDown || (lastHidKeycodeAt[kc].map { now - $0 < 0.12 } ?? false))
                 if !suppress { L("⚠️ F5 事件到达时语音键标记未立，漏过一次（请反馈）") }
                 return
             }
@@ -603,10 +884,27 @@ final class Engine: ObservableObject {
         saveConfig()
     }
 
+    func setLongPressSpecial(usage: Int, keycode: Int?) {
+        guard usage != -1, let i = config.buttons.firstIndex(where: { $0.usage == usage }) else { return }
+        config.buttons[i].longPressKeycode = keycode
+        L(keycode == nil ? "已清除长按动作" : "已设置长按动作 → \(KeyNames.label(keycode: keycode!, cmd: false, shift: false, opt: false, ctrl: false))")
+        saveConfig()
+    }
+
     private func startSpecial(_ code: Int) {
         switch code {
         case KeyNames.kMouseClick:  postMouse(.leftMouseDown, .left)
         case KeyNames.kMouseRClick: postMouse(.rightMouseDown, .right)
+        case KeyNames.kLockScreen:
+            lockScreen()
+        case KeyNames.kScreenshotAndLock:
+            // Save a full-screen screenshot first; lock shortly afterwards so the
+            // screenshot reflects the current coding context rather than the lock UI.
+            postKey(0x14, down: true, cmd: true, shift: true, opt: false, ctrl: false)
+            postKey(0x14, down: false, cmd: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in self?.lockScreen() }
+        case KeyNames.kShutdownConfirm:
+            confirmShutdown()
         default:
             specialCode = code; mouseSpeed = 4
             specialTimer?.invalidate()
@@ -621,6 +919,28 @@ final class Engine: ObservableObject {
         case KeyNames.kMouseRClick: postMouse(.rightMouseUp, .right)
         default: specialTimer?.invalidate(); specialTimer = nil
         }
+    }
+    private func lockScreen() {
+        // Use the standard ⌃⌘Q shortcut directly.  The former AppleScript route
+        // also required a separate Automation permission for System Events and
+        // silently failed when that permission had not been granted.
+        guard AXIsProcessTrusted() else {
+            L("❌ 锁屏未执行：请先在设置中授权辅助功能")
+            return
+        }
+        postKey(0x0C, down: true, cmd: true, ctrl: true)
+        postKey(0x0C, down: false, cmd: false)
+        L("→ 已发送锁屏快捷键 ⌃⌘Q")
+    }
+    private func confirmShutdown() {
+        let alert = NSAlert()
+        alert.messageText = "要关机吗？"
+        alert.informativeText = "这是由遥控器长按电源键触发的。未保存的工作可能会丢失。"
+        alert.addButton(withTitle: "关机")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let script = NSAppleScript(source: "tell application \"System Events\" to shut down")
+        _ = script?.executeAndReturnError(nil)
     }
     private func specialTick() {
         switch specialCode {
@@ -669,14 +989,34 @@ final class Engine: ObservableObject {
     // ---------- synthesize keys ----------
     private let evSrc = CGEventSource(stateID: .hidSystemState)
     func postKey(_ code: CGKeyCode, down: Bool, cmd: Bool, shift: Bool = false, opt: Bool = false, ctrl: Bool = false) {
-        guard let e = CGEvent(keyboardEventSource: evSrc, virtualKey: code, keyDown: down) else { return }
+        guard AXIsProcessTrusted() else {
+            if code == 0x3F && down { L("❌ Fn 未发送：需要在系统设置中允许 MiVibeBoard 的辅助功能权限") }
+            return
+        }
         var flags: CGEventFlags = []
         if down {
             if cmd { flags.insert(.maskCommand) }
             if shift { flags.insert(.maskShift) }
             if opt { flags.insert(.maskAlternate) }
             if ctrl { flags.insert(.maskControl) }
+            // Fn is a modifier in macOS, not merely a normal virtual key.  Sending
+            // both the key code and secondary-Fn flag makes remote hold behave like
+            // holding the physical Fn key for input methods such as WeChat IME.
+            if code == 0x3F { flags.insert(.maskSecondaryFn) }
         }
+        // macOS delivers the physical Fn key as a modifier transition, not as a
+        // normal keyDown/keyUp pair.  Several input methods intentionally ignore
+        // synthetic normal key events for Fn, so use the matching event family.
+        if code == 0x3F {
+            guard let e = CGEvent(keyboardEventSource: evSrc, virtualKey: code, keyDown: down) else { return }
+            e.type = .flagsChanged
+            e.flags = flags
+            e.setIntegerValueField(.eventSourceUserData, value: kSyntheticMarker)
+            e.post(tap: .cghidEventTap)
+            L(down ? "→ 已发送 Fn 按下（flagsChanged）" : "→ 已发送 Fn 松开（flagsChanged）")
+            return
+        }
+        guard let e = CGEvent(keyboardEventSource: evSrc, virtualKey: code, keyDown: down) else { return }
         e.flags = flags
         e.setIntegerValueField(.eventSourceUserData, value: kSyntheticMarker)
         e.post(tap: .cghidEventTap)
@@ -690,6 +1030,7 @@ final class BTProxy: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManagerDidUpdateState(_ c: CBCentralManager) { Task { @MainActor in e?.btStateChanged(c) } }
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) { Task { @MainActor in e?.didConnect(p) } }
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) { Task { @MainActor in e?.didDisconnect() } }
+    func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) { Task { @MainActor in e?.centralManager(c, didFailToConnect: p, error: error) } }
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral, advertisementData d: [String : Any], rssi RSSI: NSNumber) {
         guard let name = (p.name ?? d[CBAdvertisementDataLocalNameKey] as? String)?.lowercased() else { return }
         let keywords = ["小米蓝牙","遥控","语音","xiaomi","mi tv","mitv","mi remote","miremote","aibao"]
@@ -699,5 +1040,6 @@ final class BTProxy: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) { Task { @MainActor in e?.didServices(p) } }
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) { Task { @MainActor in e?.didChars(p, s) } }
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) { Task { @MainActor in e?.didNotify(p, ch) } }
+    func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error: Error?) { Task { @MainActor in e?.didWrite(p, ch, error: error) } }
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) { Task { @MainActor in e?.didValue(p, ch) } }
 }

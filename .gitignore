@@ -1,10 +1,11 @@
-# Mac
 .DS_Store
+.obs-code/
 *.swp
 *.swo
 *~
 
-# Build outputs
+# Local build products and redistributable archives are published as Releases,
+# not committed as source.
 mac-app/build/
 esp32-bridge/build/
 */.pio/
@@ -22,3 +23,6 @@ esp32-bridge/build/
 
 # ESP-IDF
 esp32-bridge/dependencies.lock
+
+# Local installer cache; do not redistribute a third-party audio driver in source.
+mac-app/Resources/drivers/

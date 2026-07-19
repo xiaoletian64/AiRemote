@@ -24,10 +24,12 @@ enum KeyNames {
     static let kMouseUp = 0x10001, kMouseDown = 0x10002, kMouseLeft = 0x10003, kMouseRight = 0x10004
     static let kMouseClick = 0x10005, kMouseRClick = 0x10006
     static let kScrollUp = 0x10007, kScrollDown = 0x10008
+    static let kLockScreen = 0x10009, kScreenshotAndLock = 0x1000A, kShutdownConfirm = 0x1000B
     static let specials: [(name: String, code: Int)] = [
         ("鼠标 ↑", kMouseUp), ("鼠标 ↓", kMouseDown), ("鼠标 ←", kMouseLeft), ("鼠标 →", kMouseRight),
         ("鼠标左键", kMouseClick), ("鼠标右键", kMouseRClick),
         ("滚轮 ↑", kScrollUp), ("滚轮 ↓", kScrollDown),
+        ("锁定屏幕", kLockScreen), ("截屏后锁屏", kScreenshotAndLock), ("关机（确认）", kShutdownConfirm),
     ]
     static func label(keycode: Int, cmd: Bool, shift: Bool, opt: Bool, ctrl: Bool) -> String {
         if keycode == kNone { return "（不映射 / 保持原键）" }
@@ -68,11 +70,14 @@ struct ButtonMapping: Identifiable, Codable {
     var shift: Bool
     var opt: Bool
     var ctrl: Bool
+    /// nil means this button has no distinct long-press action.
+    var longPressKeycode: Int?
     var id: Int { usage }
 
-    init(usage: Int, name: String, keycode: Int = 0xFFFF, cmd: Bool = false, shift: Bool = false, opt: Bool = false, ctrl: Bool = false) {
+    init(usage: Int, name: String, keycode: Int = 0xFFFF, cmd: Bool = false, shift: Bool = false, opt: Bool = false, ctrl: Bool = false, longPressKeycode: Int? = nil) {
         self.usage = usage; self.name = name; self.keycode = keycode
         self.cmd = cmd; self.shift = shift; self.opt = opt; self.ctrl = ctrl
+        self.longPressKeycode = longPressKeycode
     }
     var display: String { KeyNames.label(keycode: keycode, cmd: cmd, shift: shift, opt: opt, ctrl: ctrl) }
 }
@@ -88,21 +93,30 @@ struct Config: Codable {
         (0x65, "菜单 Menu"), (0x35, "TV 键"), (0x66, "电源 Power"),
         (0x80, "音量 +"), (0x81, "音量 −"),
     ]
-    // sensible defaults (keycodes)
+    // sensible defaults (keycodes) — 开箱即用：方向键、Enter、Esc、Tab、空格
     static let defaultTarget: [Int: (Int,Bool,Bool,Bool,Bool)] = [
-        0x52:(0x7E,false,false,false,false), 0x51:(0x7D,false,false,false,false),
-        0x50:(0x7B,false,false,false,false), 0x4F:(0x7C,false,false,false,false),
-        0x28:(0x24,false,false,false,false), 0xF1:(0x35,false,false,false,false),
+        0x52:(0x7E,false,false,false,false),  // ↑
+        0x51:(0x7D,false,false,false,false),  // ↓
+        0x50:(0x7B,false,false,false,false),  // ←
+        0x4F:(0x7C,false,false,false,false),  // →
+        0x28:(0x24,false,false,false,false),  // OK → Enter
+        0xF1:(0x33,false,false,false,false),  // Back → Delete（按住连续删除）
+        0x4A:(0x23,true,false,false,false),   // Home → ⌘P（Cloud Coding 快速打开）
+        0x65:(0x35,false,false,false,false),  // Menu → Esc
+        0x66:(KeyNames.kScreenshotAndLock,false,false,false,false), // Power → 截屏后锁屏
+        // 0x35 TV 键、0x66 电源、0x80/0x81 音量 ± 保持原键（不拦截）
+        // macOS 自带的音量调节和电源弹窗即可用
     ]
     static var defaultConfig: Config {
         let btns = known.map { k -> ButtonMapping in
             if let t = defaultTarget[k.usage] {
-                return ButtonMapping(usage: k.usage, name: k.name, keycode: t.0, cmd: t.1, shift: t.2, opt: t.3, ctrl: t.4)
+                return ButtonMapping(usage: k.usage, name: k.name, keycode: t.0, cmd: t.1, shift: t.2, opt: t.3, ctrl: t.4,
+                                     longPressKeycode: k.usage == 0x66 ? KeyNames.kShutdownConfirm : nil)
             }
             return ButtonMapping(usage: k.usage, name: k.name)
         }
         return Config(buttons: btns,
-                      voice: ButtonMapping(usage: -1, name: "语音键", keycode: 0x36, cmd: true),
+                      voice: ButtonMapping(usage: -1, name: "语音键", keycode: 0x3F, cmd: false),
                       voiceStartsMic: true)
     }
     mutating func mergeKnown() {
@@ -127,6 +141,10 @@ final class ConfigStore {
             return Config.defaultConfig
         }
         cfg.mergeKnown()
+        // Voice is intentionally not a configurable shortcut. The remote's F5 is
+        // mapped at the HID layer to macOS's real Apple Globe/Fn usage so WeChat
+        // IME receives a hardware-style Fn hold rather than a synthetic key event.
+        cfg.voice = ButtonMapping(usage: -1, name: "语音键", keycode: 0x3F, cmd: false)
         return cfg
     }
     static func save(_ cfg: Config) {
