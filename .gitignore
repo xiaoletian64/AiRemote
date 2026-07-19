@@ -1,0 +1,24 @@
+# Mac
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Build outputs
+mac-app/build/
+esp32-bridge/build/
+*/.pio/
+*.o
+*.obj
+*.elf
+
+# IDE
+.vscode/
+.idea/
+*.sw[op]
+
+# SDK tools
+**/sdkconfig
+
+# ESP-IDF
+esp32-bridge/dependencies.lock

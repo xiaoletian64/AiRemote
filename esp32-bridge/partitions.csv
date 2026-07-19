@@ -1,0 +1,5 @@
+# remote_bridge 分区表
+# 名称,      类型, 子类型,  偏移,  大小,  标志
+nvs,        data, nvs,     ,      0x4000,
+phy_init,   data, phy,     ,      0x1000,
+factory,    app,  factory, ,      2M,
