@@ -55,31 +55,52 @@ struct Biquad {
         b.a1 = -2*cw/a0; b.a2 = (1 - al/A)/a0
         return b
     }
+    static func lowshelf(f0: Float, fs: Float, q: Float, dbGain: Float) -> Biquad {
+        let A = pow(10, dbGain/40)
+        let w = 2*Float.pi*f0/fs, cw = cos(w), al = sin(w)/(2*q), a0 = 1 + al/A
+        var b = Biquad()
+        b.b0 = (1 + al*A)/a0; b.b1 = -2*cw/a0; b.b2 = (1 - al*A)/a0
+        b.a1 = -2*cw/a0; b.a2 = (1 - al/A)/a0
+        return b
+    }
 }
 
 struct VoiceDSP {
-    var hp = Biquad.highpass(f0: 100, fs: 16000, q: 0.707)   // 滤掉 100Hz 以下轰声
-    var eq = Biquad.peaking(f0: 2500, fs: 16000, q: 1.0, dbGain: 3)  // 提亮人声清晰度
-    var env: Float = 0      // 电平包络（噪声门/AGC 共用）
-    var gate: Float = 0     // 门开度 0…1
-    var gain: Float = 4     // AGC 当前增益，跨次保留学到的值
-    mutating func reset() { hp.reset(); eq.reset(); env = 0; gate = 0 }
+    var hp = Biquad.highpass(f0: 120, fs: 16000, q: 0.8)     // 滤低频噪声
+    var ls = Biquad.lowshelf(f0: 200, fs: 16000, q: 0.5, dbGain: -4)  // 压 200Hz 嗡嗡声
+    var eq = Biquad.peaking(f0: 2500, fs: 16000, q: 1.0, dbGain: 3)  // 提亮人声
+    var env: Float = 0
+    var gate: Float = 0
+    var gain: Float = 4
+    var noiseFloor: Float = 0.0025
+    var noiseMin: Float = 1.0
+    mutating func reset() { hp.reset(); ls.reset(); eq.reset(); env = 0; gate = 0; noiseFloor = 0.0025; noiseMin = 1.0 }
     mutating func process(_ xs: [Float]) -> [Float] {
         var out = [Float](); out.reserveCapacity(xs.count)
-        let floorLevel: Float = 0.0025   // ≈ -52 dBFS，低于此视为底噪
         for x0 in xs {
-            var x = eq.run(hp.run(x0))
+            var x = eq.run(ls.run(hp.run(x0)))
             env = max(abs(x), env * 0.999)
-            // 噪声门：说话快开（~1ms），停顿慢关（~100ms），关到 5% 而非全静音以免生硬
-            let want: Float = env > floorLevel ? 1 : 0.05
-            gate += (want - gate) * (want > gate ? 0.05 : 0.0005)
-            x *= gate
-            // AGC：把电平缓慢拉向目标响度，增益限 1…24 倍
-            if env > floorLevel {
-                let desired = min(24, max(1, 0.25 / max(env, 1e-4)))
-                gain += (desired - gain) * 0.0008
+            noiseMin = min(noiseMin, abs(x) + 1e-6)
+            if abs(x) < noiseFloor * 2 {
+                noiseFloor += (noiseMin - noiseFloor) * 0.001
+            } else if env < noiseFloor * 4 {
+                noiseFloor += (0.0025 - noiseFloor) * 0.0001
             }
-            out.append(tanh(x * gain))   // 软限幅防爆音
+            noiseFloor = max(0.0003, min(0.008, noiseFloor))
+            noiseMin = min(noiseMin + 0.00001, 1.0)
+            let snr = env / max(noiseFloor, 1e-6)
+            let gateOpen: Float
+            if snr > 3.5 { gateOpen = 1.0 }
+            else if snr < 1.8 { gateOpen = 0.02 }
+            else { gateOpen = (snr - 1.8) / 1.7 * 0.98 + 0.02 }
+            let rate: Float = gateOpen > gate ? 0.05 : 0.0003
+            gate += (gateOpen - gate) * rate
+            x *= gate
+            if env > noiseFloor * 3 {
+                let desired = min(24, max(1, 0.25 / max(env, 1e-4)))
+                gain += (desired - gain) * 0.001
+            }
+            out.append(tanh(x * gain))
         }
         return out
     }
@@ -115,6 +136,9 @@ final class Engine: ObservableObject {
     @Published var capturingUsage: Int? = nil // which button is currently recording a key (-1 = voice)
     @Published var launchAtLogin = (SMAppService.mainApp.status == .enabled)
     @Published var log: [String] = []
+    @Published var scanning = false
+    @Published var lastFoundName: String? = nil
+    @Published var lastRSSI: Int = 0
 
     var config = ConfigStore.load()
 
@@ -359,18 +383,50 @@ final class Engine: ObservableObject {
     // ---------- BLE (ATVV voice + mic) ----------
     fileprivate func btStateChanged(_ c: CBCentralManager) {
         btOn = (c.state == .poweredOn)
-        if btOn { connectRemote() }
+        if btOn { startSearching() }
     }
-    func connectRemote() {
+    func startSearching() {
         guard let c = cm, c.state == .poweredOn else { return }
+        // 1) 优先看是否已在系统蓝牙里配对过（不需要重扫）
         if let d = c.retrieveConnectedPeripherals(withServices: seed).first {
             dev = d; d.delegate = proxy; capsSent = false; c.connect(d, options: nil)
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.connectRemote() }
+            L("🔗 已连接系统配对的遥控器: \(d.name ?? "?")")
+            return
+        }
+        // 2) 否则主动扫描，按名字匹配
+        if !scanning {
+            scanning = true
+            lastFoundName = nil
+            c.scanForPeripherals(withServices: nil, options: [
+                CBCentralManagerScanOptionAllowDuplicatesKey: false,
+                CBCentralManagerScanOptionSolicitedServiceUUIDsKey: seed
+            ])
+            L("🎧 正在扫描小米蓝牙语音遥控器…")
+            L("💡 提示：长按遥控器【主页+菜单】5秒，指示灯快闪即进入配对模式")
+            // 30 秒内没找到就停止扫描
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                guard let s = self, s.scanning else { return }
+                s.cm.stopScan(); s.scanning = false
+                s.L("⚠️ 30 秒内未发现遥控器，将在 3 秒后重试。")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.startSearching() }
+            }
         }
     }
+    func retryScan() { startSearching() }
+    fileprivate func didDiscover(_ p: CBPeripheral, rssi: Int) {
+        // 第一个匹配的就停止扫描、连接
+        cm.stopScan(); scanning = false
+        lastFoundName = p.name ?? "?"
+        lastRSSI = rssi
+        L("📡 发现 \(p.name ?? "遥控器") (RSSI \(rssi)dBm)，正在连接…")
+        dev = p; p.delegate = proxy; capsSent = false; cm.connect(p, options: nil)
+    }
     fileprivate func didConnect(_ p: CBPeripheral) { remoteConnected = true; p.discoverServices([ATVV]) }
-    fileprivate func didDisconnect() { remoteConnected = false; handshakeReady = false; streaming = false; connectRemote() }
+    fileprivate func didDisconnect() {
+        remoteConnected = false; handshakeReady = false; streaming = false
+        // 自动重连：先看是否系统配对，再扫描
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startSearching() }
+    }
     fileprivate func didServices(_ p: CBPeripheral) {
         if let s = p.services?.first(where: { $0.uuid == ATVV }) { p.discoverCharacteristics([TX,RX,CTL], for: s) }
     }
@@ -634,6 +690,12 @@ final class BTProxy: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManagerDidUpdateState(_ c: CBCentralManager) { Task { @MainActor in e?.btStateChanged(c) } }
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) { Task { @MainActor in e?.didConnect(p) } }
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) { Task { @MainActor in e?.didDisconnect() } }
+    func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral, advertisementData d: [String : Any], rssi RSSI: NSNumber) {
+        guard let name = (p.name ?? d[CBAdvertisementDataLocalNameKey] as? String)?.lowercased() else { return }
+        let keywords = ["小米蓝牙","遥控","语音","xiaomi","mi tv","mitv","mi remote","miremote","aibao"]
+        guard keywords.contains(where: { name.contains($0) }) else { return }
+        Task { @MainActor in e?.didDiscover(p, rssi: RSSI.intValue) }
+    }
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) { Task { @MainActor in e?.didServices(p) } }
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) { Task { @MainActor in e?.didChars(p, s) } }
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) { Task { @MainActor in e?.didNotify(p, ch) } }
