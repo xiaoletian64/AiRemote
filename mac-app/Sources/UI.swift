@@ -104,8 +104,28 @@ struct ContentView: View {
     var connection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("遥控器连接").font(.headline)
-            HStack { StatusDot(ok: e.remoteConnected); Text(e.remoteConnected ? "已连接：小米蓝牙语音遥控器" : "未连接（请在系统蓝牙里配对连接遥控器）") }
-            HStack { StatusDot(ok: e.handshakeReady); Text(e.handshakeReady ? "语音通道就绪" : "语音通道未就绪") }
+            if e.remoteConnected {
+                HStack { StatusDot(ok: true); Text("已连接：小米蓝牙语音遥控器 \(e.lastFoundName ?? "")").foregroundColor(.green) }
+                HStack { StatusDot(ok: e.handshakeReady); Text(e.handshakeReady ? "语音通道就绪" : "语音通道未就绪") }
+            } else if e.scanning {
+                HStack { StatusDot(ok: false); Text("正在扫描…").foregroundColor(.orange) }
+                HStack(spacing: 12) {
+                    Image(systemName: "antenna.radiowaves.left.and.right").foregroundColor(.blue)
+                    Text("长按遥控器【主页】+【菜单】5 秒进入配对模式").font(.caption).foregroundColor(.secondary)
+                }
+                ProgressView().scaleEffect(0.7)
+            } else {
+                HStack { StatusDot(ok: false); Text("未连接").foregroundColor(.orange) }
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("1. 拿起遥控器", systemImage: "1.circle").font(.caption).foregroundColor(.secondary)
+                    Label("2. 同时长按【主页】+【菜单】5 秒", systemImage: "2.circle").font(.caption).foregroundColor(.secondary)
+                    Label("3. 指示灯快闪后，App 自动连接", systemImage: "3.circle").font(.caption).foregroundColor(.secondary)
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.1)))
+                Button("重试扫描", action: { e.retryScan() })
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
             if e.micStreaming { HStack { StatusDot(ok: true); Text("🎤 正在采集语音 → BlackHole").foregroundColor(.green) } }
         }
     }
