@@ -66,13 +66,18 @@ fi
 
 # The remote itself supplies the native Globe/Fn event through a device-specific
 # HID mapping. Direct public distribution requires a Developer ID Application
-# certificate; an App Store Apple Distribution certificate is intentionally not
-# used here because it cannot be notarized for website/GitHub distribution.
+# certificate. Until one is installed, use the existing Apple Distribution
+# identity consistently for local builds so macOS keeps one TCC identity; this
+# fallback is not a substitute for Developer ID notarization.
 xattr -cr "$APP" 2>/dev/null || true
 SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-}"
 if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
         | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)
+fi
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Apple Distribution:.*\)"/\1/p' | head -1)
 fi
 if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
@@ -82,7 +87,7 @@ if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
     echo "→ 使用 Developer ID（可用于后续公证）: $SIGN_IDENTITY"
     codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
 elif [ -n "$SIGN_IDENTITY" ]; then
-    echo "→ 使用 Apple Development 本机构建签名: $SIGN_IDENTITY"
+    echo "→ 使用稳定本机构建签名: $SIGN_IDENTITY"
     codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
 else
     echo "→ 未找到 Developer ID / Apple Development 证书，回退 ad-hoc 签名"

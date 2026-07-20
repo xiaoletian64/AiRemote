@@ -19,7 +19,7 @@
 | 方向键 | 光标方向 |
 | OK | Return |
 | Back | 单击 Delete；按住后渐进加速连续删除 |
-| Home | 显示桌面（主页） |
+| Home | `⌘V`，粘贴剪贴板中刚完成的语音转写 |
 | Menu | 短按 Esc；长按 `⌃C` 中断终端/AI 任务 |
 | Power 短按 | 仅锁屏 |
 | Power 长按 1.5 秒 | 关机确认框 |
@@ -41,4 +41,4 @@ open build/MiVibeBoard.app
 ./build.sh --universal
 ```
 
-本机构建优先使用 Apple Development 签名。面向 GitHub/官网的正式分发包必须使用 **Developer ID Application** 签名、Hardened Runtime 和 Apple 公证；Apple Distribution 证书仅用于 Mac App Store 提交，不能替代 Developer ID。
+本机构建优先使用 Developer ID；在尚未配置 Developer ID 时，脚本会固定使用现有 Apple Distribution 身份，避免每次构建被 macOS 视为不同 App 而重复丢失授权。面向 GitHub/官网的正式分发包仍必须使用 **Developer ID Application** 签名、Hardened Runtime 和 Apple 公证；Apple Distribution 不能替代 Developer ID。
