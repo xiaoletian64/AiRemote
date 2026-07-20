@@ -39,19 +39,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func configureStatusItem() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Use an explicit text-only control instead of a tiny SF Symbol. macOS
+        // menus are crowded, and this app intentionally has no Dock icon.
+        let item = NSStatusBar.system.statusItem(withLength: 108)
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
         if let button = item.button {
-            // A text label makes the app discoverable among macOS's many tiny
-            // menu-bar glyphs, especially when it is running without a Dock icon.
-            button.imagePosition = .imageLeading
-            button.font = .systemFont(ofSize: 12, weight: .medium)
-            button.title = " 遥控器"
+            button.font = .systemFont(ofSize: 12, weight: .semibold)
+            button.alignment = .center
+            button.title = "● 小米遥控器"
             button.setAccessibilityLabel("小米语音遥控器菜单")
         }
         statusItem = item
+        engine.L("✅ 菜单栏入口已创建：● 小米遥控器（屏幕顶部右侧）")
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -70,11 +71,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshStatusItem() {
         guard let button = statusItem?.button else { return }
-        let symbol = engine.micStreaming ? "mic.fill" : (engine.remoteConnected ? "dot.radiowaves.left.and.right" : "dot.radiowaves.left")
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "小米语音遥控器")
-        button.image?.isTemplate = true
+        button.image = nil
         let state = engine.micStreaming ? "正在语音" : (engine.remoteConnected ? "已连接" : "未连接")
-        button.title = engine.micStreaming ? " 语音中" : " 遥控器"
+        button.title = engine.micStreaming ? "● 正在语音" : "● 小米遥控器"
         button.toolTip = "小米语音遥控器：\(state)"
 
         if lastMenuBarOnly != engine.menuBarOnly {
