@@ -7,7 +7,8 @@ import IOKit.hidsystem
 /// as a real HID modifier and is therefore accepted by input methods such as
 /// WeChat IME.
 ///
-/// The mapping is restricted to Xiaomi VID 0x2717 / PID 0x32B8.  Existing
+/// The mapping targets the Xiaomi remote keyboard service (VID 0x2717), with
+/// known remote product IDs and vendor-name variants accepted. Existing
 /// mappings for every other key are retained and the original F5 mapping is
 /// restored when the app exits.
 final class VoiceGlobeMapper {

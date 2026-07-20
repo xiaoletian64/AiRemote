@@ -1,12 +1,12 @@
 #!/bin/zsh
-# install.sh - 一键安装小米 Vibecoding 键盘
+# install.sh - 一键安装小米语音遥控器
 # 用法: ./install.sh
 set -e
 cd "$(dirname "$0")"
 
 APP_NAME="MiVibeBoard"
 
-echo "── 小米 Vibecoding 键盘 · 安装向导 ──"
+echo "── 小米语音遥控器 · 安装向导 ──"
 echo ""
 
 # 1) Homebrew
@@ -22,17 +22,9 @@ else
   echo "→ 安装 BlackHole 2ch（需要 sudo 密码）..."
   brew install --cask blackhole-2ch
   echo ""
-  echo "⚠️  BlackHole 是内核驱动，安装后【必须重启电脑】才生效。"
-  echo "请重启后再执行本脚本继续。"
-  
-  read -q "REPLY?现在要立即重启吗？(y/N) "
-  echo ""
-  if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-    sudo reboot
-    exit 0
-  fi
-  echo "→ 你选择了稍后重启。请重启后回到此目录再次运行 ./install.sh"
-  exit 0
+  echo "→ 正在刷新 CoreAudio（不重启 Mac）..."
+  sudo /usr/bin/killall coreaudiod
+  sleep 2
 fi
 
 # 3) 编译工具
@@ -61,13 +53,10 @@ cat <<EOF
 
 下一步：
   1. 系统蓝牙 → 配对连接「小米蓝牙语音遥控器」
-  2. 右键 /Applications/${APP_NAME}.app → 打开（首次需要）
+  2. 打开 /Applications/${APP_NAME}.app
      菜单栏会出现 🎤 图标
-  3. 点图标 → 设置 → 给三个权限：
-        • 蓝牙
-        • 辅助功能（合成按键必需）
-        • 输入监控（拦截按键必需）
-  4. 在系统设置 → 声音 → 输入 → 选 "BlackHole 2ch"
+  3. 首次系统请求时允许蓝牙、辅助功能、输入监控
+  4. App 会自动将 "BlackHole 2ch" 设为系统输入
      即可让任意 App（如飞书/Zoom/Whisper/输入法）使用遥控器麦克风
   5. 按住遥控器语音键说话 → 系统级语音输入
 

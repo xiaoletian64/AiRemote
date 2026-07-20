@@ -8,7 +8,7 @@
 
 1. 安装 BlackHole：`brew install --cask blackhole-2ch`。
 2. 在“系统设置 → 声音 → 输入”选择 **BlackHole 2ch**。
-3. 打开 MiVibeBoard，授予蓝牙、辅助功能、输入监控权限。
+3. 打开“**小米语音遥控器**”；首次系统请求时允许蓝牙、辅助功能、输入监控。
 4. 长按遥控器“主页 + 菜单”约 5 秒进入配对；应用会自动连接。
 5. 在“按键映射”页按需录制快捷键或选择鼠标/系统动作。
 
@@ -18,9 +18,9 @@
 | --- | --- |
 | 方向键 | 光标方向 |
 | OK | Return |
-| Back | Delete；按住后连续删除 |
+| Back | 单击 Delete；按住后渐进加速连续删除 |
 | Home | `⌘P`（VS Code/Cursor 快速打开） |
-| Menu | Esc |
+| Menu | 短按 Esc；长按 `⌃C` 中断终端/AI 任务 |
 | Power 短按 | 截全屏后锁屏 |
 | Power 长按 1.5 秒 | 关机确认框 |
 | 语音键 | 固定为原生 `Fn` / Globe，同时转发音频到 BlackHole |
@@ -41,4 +41,4 @@ open build/MiVibeBoard.app
 ./build.sh --universal
 ```
 
-构建产物是 ad-hoc 签名，首次打开可能需要在 Finder 中按住 Control 点击应用并选择“打开”。不需要 Apple 虚拟 HID entitlement 或额外开发者申请。
+本机构建优先使用 Apple Development 签名。面向 GitHub/官网的正式分发包必须使用 **Developer ID Application** 签名、Hardened Runtime 和 Apple 公证；Apple Distribution 证书仅用于 Mac App Store 提交，不能替代 Developer ID。

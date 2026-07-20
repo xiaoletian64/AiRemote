@@ -8,7 +8,6 @@ struct ContentView: View {
 
     private var remoteReady: Bool { e.btOn && e.remoteConnected && e.handshakeReady }
     private var voiceReady: Bool { remoteReady && e.blackholeSelectedAsInput && e.hardwareGlobeReady }
-    private var needsPermissions: Bool { !e.axTrusted || !e.inputMonitoringOK }
 
     var body: some View {
         TabView(selection: $selectedTab) {
