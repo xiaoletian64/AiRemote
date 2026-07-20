@@ -755,6 +755,10 @@ final class Engine: ObservableObject {
         guard hidMgr == nil else { return }
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else { return }
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, 0)
+        // Xiaomi uses the same vendor ID across several Bluetooth remote models.
+        // Do not lock this path to one product ID; reports are accepted only when
+        // they contain a known remote usage, so unrelated Xiaomi HID devices are
+        // left untouched.
         IOHIDManagerSetDeviceMatching(mgr, [kIOHIDVendorIDKey: 0x2717] as CFDictionary)
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
         let openRes = IOHIDManagerOpen(mgr, 0)
@@ -802,15 +806,13 @@ final class Engine: ObservableObject {
         L("已重置遥控器 HID 监听")
     }
 
-    /// Xiaomi remotes expose slightly different HID report layouts by model.  Rather
-    /// than relying on one fixed byte offset, find known usages anywhere in a report.
-    /// A report containing no known usage is the release report for the active key.
+    /// Xiaomi remotes expose both compact and keyboard-array report layouts.
+    /// Normalize either form before dispatching a button action.
     private func handleHIDReport(_ bytes: [UInt8]) {
         let known = Set(config.buttons.map { UInt8(truncatingIfNeeded: $0.usage) } + [HIDMap.voiceUsage])
-        let candidates = bytes.filter { known.contains($0) && $0 != 0 }
-        if let usage = candidates.last {
+        if let usage = XiaomiRemoteHIDParser.usage(in: bytes, known: known) {
             hidReport(usage: usage)
-        } else if bytes.allSatisfy({ $0 == 0 }) || (bytes.count > 1 && bytes.dropFirst().allSatisfy({ $0 == 0 })) {
+        } else if XiaomiRemoteHIDParser.isRelease(bytes) {
             hidReport(usage: 0)
         } else {
             let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")

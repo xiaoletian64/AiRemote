@@ -99,7 +99,13 @@ final class VoiceGlobeMapper {
     private func isXiaomiRemote(_ service: IOHIDServiceClient) -> Bool {
         let vendor = IOHIDServiceClientCopyProperty(service, kIOHIDVendorIDKey as CFString) as? NSNumber
         let product = IOHIDServiceClientCopyProperty(service, kIOHIDProductIDKey as CFString) as? NSNumber
-        return vendor?.intValue == 0x2717 && product?.intValue == 0x32B8
+        guard vendor?.intValue == 0x2717 else { return false }
+        // RC003 / Remote 2 Pro is 0x32B8. Other Xiaomi BLE remotes have varied
+        // product IDs, but advertise a remote-shaped product name. Keep the
+        // established PID as a fallback for firmware that omits Product text.
+        if product?.intValue == 0x32B8 { return true }
+        let name = (IOHIDServiceClientCopyProperty(service, kIOHIDProductKey as CFString) as? String ?? "").lowercased()
+        return ["遥控", "remote", "mitv", "mi tv", "xiaomi tv"].contains { name.contains($0) }
     }
 
     private func registryID(_ service: IOHIDServiceClient) -> UInt64? {
