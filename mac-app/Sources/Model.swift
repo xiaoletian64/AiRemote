@@ -58,39 +58,107 @@ enum HIDMap {
     // Remote HID usage -> macOS keycode macOS also generates (for suppression).
     // Some models emit a keyboard-array report, while others emit a compact
     // byte report; Engine normalizes both forms before consulting this table.
+    //
+    // 注意：这张表只决定"要不要吞掉 macOS 收到的同源原始按键事件"，与按键最终映射成
+    // 什么动作（Config.buttons）解耦。保持原样的键（keycode == kNone）不进表，让原始事件
+    // 照常透传给系统；映射成动作的键必须进表，否则会和合成事件同时触发。
     static let usageToKeycode: [UInt8: CGKeyCode] = [
-        0x52:0x7E, 0x51:0x7D, 0x50:0x7B, 0x4F:0x7C,
-        0x28:0x24, 0x4A:0x73, 0x35:0x32, 0x65:0x6E,
+        0x52:0x7E, 0x51:0x7D, 0x50:0x7B, 0x4F:0x7C,  // 方向键
+        0x28:0x24,                                      // OK → Return
+        0x4A:0x73,                                      // Home → Home 键码（仅用于抑制；实际动作由 Config 给）
+        0x35:0x32,                                      // TV 键
+        0x65:0x6E,                                      // Menu
+        // 补全：Power/Menu 此前缺失，导致映射动作与系统电源框/菜单同时触发
+        0x66:0x7F,                                      // Power（macOS 没有 Power 虚拟键码；0x7F 仅作抑制占位）
+        // Back(0xF1) 默认映射成 Delete(0x33)，Back 的 HID 也需要吞掉原始事件，避免双触发
+        0xF1:0x33,
+        // 音量±保持原样（不进抑制表）—— macOS 蓝牙 HID 音量键即便保留也常不生效，
+        // 真正修好属另一个特性；这里至少保证不被误吞。
     ]
-    // 语音键除 BLE 语音流外还会发一个 HID F5（usage 0x3E）；macOS 把 F5 当系统听写🎤键，必须吞掉
+    // 语音键除 BLE 语音流外还会发一个 HID F5（usage 0x3E）；Globe 模式下 macOS 把 F5 当系统
+    // 听写 🎤 键必须吞掉；Left-Control 模式下 F5 被设备层重映射成 LeftControl，macOS 不再看到 F5。
     static let voiceUsage: UInt8 = 0x3E
     static let voiceKeycode: CGKeyCode = 0x60   // F5
 }
 
 enum XiaomiRemoteHIDParser {
-    /// Xiaomi remotes in the wild expose both a compact usage byte and a
-    /// report-ID-prefixed array of little-endian UInt16 usages.  Prefer a
-    /// complete UInt16 match so a report header cannot be mistaken for a key.
+    /// 小米遥控器在野外至少有三种报告形态：
+    ///   1) 紧凑 vendor 报告：单字节 usage（旧固件）
+    ///   2) 报告 ID + 小端 UInt16 usage 数组（Keyboard 页 0x07，主流形态）
+    ///   3) Consumer Control 页(0x0C) 报告：Power=0x30 / Menu=0x40 / Volume+=0xE9 / Volume-=0xEA
+    /// 本解析器在所有对齐偏移上扫描 UInt16 usage，命中 known 集合；同时把 Consumer 页
+    /// 的常见键翻译成内部统一 usage，让上层一套映射表通用。
+    ///
+    /// 解析失败时返回 nil，调用方负责打印诊断 hex + 每个非零字节，便于补 usage 表。
     static func usage(in bytes: [UInt8], known: Set<UInt8>) -> UInt8? {
         guard !bytes.isEmpty else { return nil }
+
+        // 先按 UInt16 完整匹配扫描（优先级最高，避免把 report header 当键）
         var matches: [UInt8] = []
+        // 起始偏移遍历 0/1，覆盖"有/无 report id"两种布局
         for offset in 0...min(1, max(0, bytes.count - 2)) {
             var index = offset
             while index + 1 < bytes.count {
-                let value = UInt16(bytes[index]) | UInt16(bytes[index + 1]) << 8
-                if value <= UInt16(UInt8.max), let usage = UInt8(exactly: value), known.contains(usage), usage != 0 {
+                let lo = bytes[index], hi = bytes[index + 1]
+                let value = UInt16(lo) | (UInt16(hi) << 8)
+                // Keyboard 页(0x07) usage：hi==0x07 时 lo 是 usage；lo 单字节也可能是 compact 报告
+                if hi == 0x07, known.contains(lo), lo != 0 {
+                    matches.append(lo)
+                } else if value <= UInt16(UInt8.max), let usage = UInt8(exactly: value), known.contains(usage), usage != 0 {
                     matches.append(usage)
                 }
                 index += 2
             }
         }
         if let usage = matches.last { return usage }
-        // Older remotes use a single usage byte in a vendor report.
-        return bytes.reversed().first { known.contains($0) && $0 != 0 }
+
+        // Consumer Control 页(0x0C) 翻译：value 高字节=page，低字节=usage
+        var consumerMatch: UInt8?
+        for offset in 0...min(1, max(0, bytes.count - 2)) {
+            var index = offset
+            while index + 1 < bytes.count {
+                let lo = bytes[index], hi = bytes[index + 1]
+                if hi == 0x0C {   // Consumer 页
+                    if let mapped = Self.consumerToInternal[lo] {
+                        consumerMatch = mapped
+                    }
+                }
+                index += 2
+            }
+        }
+        if let usage = consumerMatch, known.contains(usage) { return usage }
+
+        // 兜底：旧固件单字节 vendor 报告（取最后一个非零的已知 usage）
+        if let usage = bytes.reversed().first(where: { known.contains($0) && $0 != 0 }) {
+            return usage
+        }
+        return nil
     }
+
+    /// Consumer Control(0x0C) usage -> 内部统一 usage（与 Config.known 对齐）
+    private static let consumerToInternal: [UInt8: UInt8] = [
+        0x30: 0x66,   // Power
+        0x40: 0x65,   // Menu
+        0x45: 0x28,   // OK / Play→Enter（部分遥控器 OK 走 Consumer）
+        0xE9: 0x80,   // Volume Up
+        0xEA: 0x81,   // Volume Down
+        0xB3: 0x52,   // Fast Forward → 兜底当 上
+        0xB4: 0x51,   // Rewind → 兜底当 下
+    ]
 
     static func isRelease(_ bytes: [UInt8]) -> Bool {
         bytes.allSatisfy { $0 == 0 } || (bytes.count > 1 && bytes.dropFirst().allSatisfy { $0 == 0 })
+    }
+
+    /// 诊断辅助：把原始报告里每个非零字节/双字节格式化成字符串，方便日志定位未识别按键。
+    static func describe(_ bytes: [UInt8]) -> String {
+        let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+        var pairs: [String] = []
+        for i in stride(from: 0, to: bytes.count - 1, by: 2) {
+            let v = UInt16(bytes[i]) | (UInt16(bytes[i + 1]) << 8)
+            if v != 0 { pairs.append(String(format: "[%d]=0x%04X", i, v)) }
+        }
+        return hex + "  " + pairs.joined(separator: " ")
     }
 }
 
@@ -114,10 +182,50 @@ struct ButtonMapping: Identifiable, Codable {
     var display: String { KeyNames.label(keycode: keycode, cmd: cmd, shift: shift, opt: opt, ctrl: ctrl) }
 }
 
+/// 语音键映射模式。
+/// - globe: 把遥控器 F5 在 HID 层重映射成 Apple Globe/Fn，微信输入法等可识别（系统听写原语）
+/// - leftControl: 重映射成左 Control 修饰键，用于 Ctrl 组合快捷键；不触发系统听写
+enum VoiceMode: String, Codable, CaseIterable {
+    case globe
+    case leftControl
+    var label: String {
+        switch self {
+        case .globe:       return "地球 / Fn（系统听写）"
+        case .leftControl: return "左 Control（修饰键）"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .globe:       return "微信输入法等可识别，用于语音听写。会触发 macOS 原生 Fn 行为。"
+        case .leftControl: return "作为左 Control 修饰键，配合其它键发 Ctrl 组合。不会触发系统听写。"
+        }
+    }
+}
+
 struct Config: Codable {
     var buttons: [ButtonMapping]
     var voice: ButtonMapping       // usage = -1
     var voiceStartsMic: Bool
+    /// 语音键 HID 重映射目标。旧配置没有该字段时解码失败会回落到默认值。
+    var voiceMode: VoiceMode = .globe
+
+    // 自定义解码：voiceMode 是新字段，旧 config.json 缺失时回落到 .globe，避免整体解码失败
+    // 导致用户已录制的快捷键全部丢失。
+    enum CodingKeys: String, CodingKey {
+        case buttons, voice, voiceStartsMic, voiceMode
+    }
+    init(buttons: [ButtonMapping], voice: ButtonMapping, voiceStartsMic: Bool, voiceMode: VoiceMode = .globe) {
+        self.buttons = buttons; self.voice = voice
+        self.voiceStartsMic = voiceStartsMic; self.voiceMode = voiceMode
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.buttons = try c.decode([ButtonMapping].self, forKey: .buttons)
+        self.voice = try c.decode(ButtonMapping.self, forKey: .voice)
+        self.voiceStartsMic = try c.decode(Bool.self, forKey: .voiceStartsMic)
+        // 兼容旧配置：缺失或无法识别时保持默认 .globe，不破坏已有快捷键
+        self.voiceMode = (try? c.decode(VoiceMode.self, forKey: .voiceMode)) ?? .globe
+    }
 
     static let known: [(usage: Int, name: String)] = [
         (0x52, "方向 上"), (0x51, "方向 下"), (0x50, "方向 左"), (0x4F, "方向 右"),
@@ -149,7 +257,8 @@ struct Config: Codable {
         }
         return Config(buttons: btns,
                       voice: ButtonMapping(usage: -1, name: "语音键", keycode: 0x3F, cmd: false),
-                      voiceStartsMic: true)
+                      voiceStartsMic: true,
+                      voiceMode: .globe)
     }
     mutating func mergeKnown() {
         for k in Config.known {
@@ -173,14 +282,13 @@ final class ConfigStore {
             return Config.defaultConfig
         }
         cfg.mergeKnown()
-        // Voice is intentionally not a configurable shortcut. The remote's F5 is
-        // mapped at the HID layer to macOS's real Apple Globe/Fn usage so WeChat
-        // IME receives a hardware-style Fn hold rather than a synthetic key event.
+        // 语音键的"按一下发什么键"已不再用 config.voice.keycode 表达——两种模式都走 HID 设备层
+        // 重映射。这里只保证 voice 条目存在且 usage=-1，voiceMode 由用户在 UI 选择并保留。
         cfg.voice = ButtonMapping(usage: -1, name: "语音键", keycode: 0x3F, cmd: false)
         // Upgrade original defaults created before the Mac-only control scheme.
         // This runs once per install so later user changes in the mapping UI stay intact.
         let defaultsVersionKey = "mappingDefaultsVersion"
-        if UserDefaults.standard.integer(forKey: defaultsVersionKey) < 3 {
+        if UserDefaults.standard.integer(forKey: defaultsVersionKey) < 4 {
             func installDefault(_ usage: Int, keycode: Int, cmd: Bool = false, longPress: Int? = nil) {
                 guard let i = cfg.buttons.firstIndex(where: { $0.usage == usage }) else { return }
                 cfg.buttons[i].keycode = keycode
@@ -194,7 +302,8 @@ final class ConfigStore {
             installDefault(0x4A, keycode: 0x09, cmd: true)              // Home → ⌘V
             installDefault(0x65, keycode: 0x35, longPress: KeyNames.kInterrupt) // Menu → Esc / ⌃C
             installDefault(0x66, keycode: KeyNames.kLockScreen, longPress: KeyNames.kShutdownConfirm)
-            UserDefaults.standard.set(3, forKey: defaultsVersionKey)
+            // v4：首次升级到双模式语音键时，保留用户已有的 voiceMode（自定义 init 已兜底）。
+            UserDefaults.standard.set(4, forKey: defaultsVersionKey)
             save(cfg)
         }
         // Keep the original Menu → Esc default usable for configurations saved

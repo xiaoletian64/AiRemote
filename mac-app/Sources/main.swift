@@ -16,7 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 860, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
-        w.title = "小米语音遥控器"
+        w.title = "小米超级键盘"
         w.contentView = NSHostingView(rootView: ContentView(e: engine))
         w.center()
         w.isReleasedWhenClosed = false
@@ -39,33 +39,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func configureStatusItem() {
-        // Use an explicit text-only control instead of a tiny SF Symbol. macOS
-        // menus are crowded, and this app intentionally has no Dock icon.
-        let item = NSStatusBar.system.statusItem(withLength: 108)
+        // 菜单栏空间宝贵，用 NSVariableStatusItemLength 自适应宽度，避免长设备名溢出被截断。
+        // 完整设备名放在 tooltip 和下拉菜单里，标题只保留状态点 + 简称。
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
         if let button = item.button {
             button.font = .systemFont(ofSize: 12, weight: .semibold)
-            button.alignment = .center
-            button.title = "● 小米遥控器"
-            button.setAccessibilityLabel("小米语音遥控器菜单")
+            button.title = "● 遥控器"
+            button.setAccessibilityLabel("小米超级键盘菜单")
         }
         statusItem = item
-        engine.L("✅ 菜单栏入口已创建：● 小米遥控器（屏幕顶部右侧）")
+        engine.L("✅ 菜单栏入口已创建：● 遥控器（屏幕顶部右侧）")
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let state = engine.micStreaming ? "正在转发语音" : (engine.remoteConnected ? "遥控器已连接" : "遥控器未连接")
-        let stateItem = NSMenuItem(title: "小米语音遥控器 · \(state)", action: nil, keyEquivalent: "")
+        let devName = currentRemoteName
+        let state = engine.micStreaming ? "正在转发语音" : (engine.remoteConnected ? "已连接" : "未连接")
+        let stateItem = NSMenuItem(title: "\(devName) · \(state)", action: nil, keyEquivalent: "")
         stateItem.isEnabled = false
         menu.addItem(stateItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "显示主窗口", action: #selector(showMainWindow(_:)), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "重新连接遥控器", action: #selector(reconnect(_:)), keyEquivalent: "r"))
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "退出小米语音遥控器", action: #selector(quit(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "退出小米超级键盘", action: #selector(quit(_:)), keyEquivalent: "q"))
         for item in menu.items { item.target = self }
     }
 
@@ -73,13 +73,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let button = statusItem?.button else { return }
         button.image = nil
         let state = engine.micStreaming ? "正在语音" : (engine.remoteConnected ? "已连接" : "未连接")
-        button.title = engine.micStreaming ? "● 正在语音" : "● 小米遥控器"
-        button.toolTip = "小米语音遥控器：\(state)"
+        // 菜单栏标题保持简短：语音中/已连接/未连接，避免长设备名把菜单栏挤出屏幕。
+        // 状态点颜色感：语音=橙、已连接=绿、未连接=灰（用字符 ● 统一，色差靠标题文字区分）。
+        button.title = engine.micStreaming ? "● 正在语音" : (engine.remoteConnected ? "● 已连接" : "● 遥控器")
+        // 完整设备名 + 状态放 tooltip，鼠标悬停可见。
+        button.toolTip = "\(currentRemoteName)：\(state)"
 
         if lastMenuBarOnly != engine.menuBarOnly {
             lastMenuBarOnly = engine.menuBarOnly
             if engine.menuBarOnly { window?.orderOut(nil) }
         }
+    }
+
+    /// 当前选中遥控器的显示名（tooltip / 下拉菜单用）。无选中时回落到通用名。
+    private var currentRemoteName: String {
+        if let id = engine.selectedRemoteID,
+           let r = engine.discoveredRemotes.first(where: { $0.id == id }) {
+            return r.name
+        }
+        return "小米遥控器"
     }
 
     @objc private func showMainWindow(_ sender: Any?) {
