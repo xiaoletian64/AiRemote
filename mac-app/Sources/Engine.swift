@@ -139,6 +139,7 @@ final class Engine: ObservableObject {
     @Published var lastButtonUsage: Int = 0
     @Published var capturingUsage: Int? = nil // which button is currently recording a key (-1 = voice)
     @Published var launchAtLogin = (SMAppService.mainApp.status == .enabled)
+    @Published var menuBarOnly = UserDefaults.standard.bool(forKey: "menuBarOnly")
     @Published var log: [String] = []
     @Published var scanning = false
     @Published var lastFoundName: String? = nil
@@ -445,6 +446,12 @@ final class Engine: ObservableObject {
             L("开机自启设置失败: \(error.localizedDescription)（App 需位于 /Applications）")
         }
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
+    }
+
+    func setMenuBarOnly(_ on: Bool) {
+        menuBarOnly = on
+        UserDefaults.standard.set(on, forKey: "menuBarOnly")
+        L(on ? "已切换为仅菜单栏模式" : "已显示主窗口模式")
     }
 
     func checkPermissions() {

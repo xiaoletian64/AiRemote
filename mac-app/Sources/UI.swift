@@ -37,10 +37,6 @@ struct ContentView: View {
                 header
                 voiceHero
 
-                if needsPermissions {
-                    permissionCallout
-                }
-
                 Text("连接状态")
                     .font(.headline)
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
@@ -159,25 +155,6 @@ struct ContentView: View {
             LinearGradient(colors: [Color.indigo.opacity(0.13), Color.cyan.opacity(0.08)], startPoint: .topLeading, endPoint: .bottomTrailing),
             in: RoundedRectangle(cornerRadius: 22, style: .continuous)
         )
-    }
-
-    private var permissionCallout: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "lock.shield")
-                .font(.title3).foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 7) {
-                Text("还差一次系统授权") .font(.headline)
-                Text("授权后，普通按键、长按删除和锁屏才能由遥控器控制。语音与 Fn 映射不受影响。")
-                    .font(.subheadline).foregroundStyle(.secondary)
-                HStack {
-                    if !e.axTrusted { Button("允许辅助功能") { e.requestAX() } }
-                    if !e.inputMonitoringOK { Button("允许输入监控") { e.requestInputMonitoring() } }
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(16)
-        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     // MARK: - Mapping
@@ -341,8 +318,13 @@ struct ContentView: View {
                 }
 
                 GroupBox("应用") {
-                    Toggle("登录时自动启动", isOn: Binding(get: { e.launchAtLogin }, set: e.setLaunchAtLogin))
-                        .padding(.vertical, 3)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("登录时自动启动", isOn: Binding(get: { e.launchAtLogin }, set: e.setLaunchAtLogin))
+                        Toggle("仅保留菜单栏图标", isOn: Binding(get: { e.menuBarOnly }, set: e.setMenuBarOnly))
+                        Text("开启后可从菜单栏图标查看状态、重新连接或重新打开主窗口。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 3)
                 }
 
                 DisclosureGroup("诊断与事件日志", isExpanded: $showDiagnostics) {
