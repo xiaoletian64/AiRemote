@@ -490,7 +490,7 @@ final class Engine: ObservableObject {
         blackholeSelectedAsInput = status == noErr && Self.defaultInputDevice() == device
         L(blackholeSelectedAsInput ? "✅ 已自动选择 BlackHole 为系统输入" : "⚠️ BlackHole 已检测到，但设为系统输入失败 (OSStatus \(status))")
     }
-    /// Each TCC permission is requested only from its explicit UI button.  Repeated
+    /// Explicit retry actions for the one-time initial TCC request. Repeated
     /// automatic prompts are noisy and macOS ignores them after the first denial.
     func requestAX() {
         if !AXIsProcessTrusted() {
@@ -1149,7 +1149,7 @@ final class Engine: ObservableObject {
     private let evSrc = CGEventSource(stateID: .hidSystemState)
     func postKey(_ code: CGKeyCode, down: Bool, cmd: Bool, shift: Bool = false, opt: Bool = false, ctrl: Bool = false) {
         guard AXIsProcessTrusted() else {
-            if code == 0x3F && down { L("❌ Fn 未发送：需要在系统设置中允许 MiVibeBoard 的辅助功能权限") }
+            if code == 0x3F && down { L("❌ Fn 未发送：需要在系统设置中允许「小米语音遥控器」的辅助功能权限") }
             return
         }
         var flags: CGEventFlags = []

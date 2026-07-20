@@ -6,9 +6,7 @@
 
 ---
 
-## 🎯 双产品线
-
-### 线 A：Mac App（MVP，纯软件）
+## 🎯 当前产品：Mac App
 
 **[`mac-app/`](mac-app/)** — 3 分钟安装，即刻使用
 
@@ -27,17 +25,6 @@
 ---
 
 ## 决策对比
-
-| 维度 | Mac App | ESP32 Bridge |
-|---|---|---|
-| 按键映射自定义 | ✅ 录制目标键 | ⚠️ 待 WebUI |
-| 跨平台 | ❌ macOS only | ✅ 任意电脑 |
-| 安装门槛 | 低（脚本一条命令） | 中（烙铁+烧录） |
-| 语音延迟 | 极低 (BlackHole 直通) | 低 (USB 高速) |
-| 用户体验 | 需要软件常驻 | 即插即用 |
-| 开机自启 | ✅ LaunchAgent | 无需 |
-
----
 
 ## 协议
 
@@ -59,8 +46,6 @@ Service  AB5E0001-5A21-4F05-BC7D-AF01F617B664
 ```
 AiRemote/
 ├── README.md                   本文档
-├── docs/
-│   └── PROTOCOL.md             ATVV 协议详解（待补）
 ├── mac-app/                    线 A：Mac 软件
 │   ├── Sources/                Engine + Model + UI + main
 │   ├── Resources/              Info.plist + AppIcon.icns

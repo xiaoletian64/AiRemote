@@ -65,23 +65,27 @@ else
 fi
 
 # The remote itself supplies the native Globe/Fn event through a device-specific
-# HID mapping. Prefer an Apple identity so macOS sees one stable application
-# identity across updates and does not duplicate TCC entries.
+# HID mapping. Direct public distribution requires a Developer ID Application
+# certificate; an App Store Apple Distribution certificate is intentionally not
+# used here because it cannot be notarized for website/GitHub distribution.
 xattr -cr "$APP" 2>/dev/null || true
 SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-}"
 if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-        | sed -n 's/.*"\(Apple Distribution:.*\)"/\1/p' | head -1)
+        | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)
 fi
 if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
         | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' | head -1)
 fi
-if [ -n "$SIGN_IDENTITY" ]; then
-    echo "→ 使用稳定 Apple 签名: $SIGN_IDENTITY"
+if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
+    echo "→ 使用 Developer ID（可用于后续公证）: $SIGN_IDENTITY"
+    codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+elif [ -n "$SIGN_IDENTITY" ]; then
+    echo "→ 使用 Apple Development 本机构建签名: $SIGN_IDENTITY"
     codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
 else
-    echo "→ 未找到 Apple 证书，回退 ad-hoc 签名"
+    echo "→ 未找到 Developer ID / Apple Development 证书，回退 ad-hoc 签名"
     codesign --force --deep --sign - "$APP"
 fi
 
@@ -137,8 +141,8 @@ EOF
         -imagekey zlib-level=9 \
         "$DMG" 2>&1 | tail -3
 
-    # 给 DMG 也加 ad-hoc 签名（不能 notarize 但是可以验证完整性）
-    codesign --force --sign - "$DMG" 2>/dev/null || true
+    # A Developer ID-signed app inside the DMG is ready for notarization. The
+    # DMG itself is stapled only after notarytool accepts the upload.
 
     rm -rf "$STAGING"
     echo "✅ DMG: $DMG"
