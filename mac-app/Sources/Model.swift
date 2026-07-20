@@ -24,12 +24,13 @@ enum KeyNames {
     static let kMouseUp = 0x10001, kMouseDown = 0x10002, kMouseLeft = 0x10003, kMouseRight = 0x10004
     static let kMouseClick = 0x10005, kMouseRClick = 0x10006
     static let kScrollUp = 0x10007, kScrollDown = 0x10008
-    static let kLockScreen = 0x10009, kScreenshotAndLock = 0x1000A, kShutdownConfirm = 0x1000B
+    static let kLockScreen = 0x10009, kScreenshotAndLock = 0x1000A, kShutdownConfirm = 0x1000B, kInterrupt = 0x1000C
     static let specials: [(name: String, code: Int)] = [
         ("鼠标 ↑", kMouseUp), ("鼠标 ↓", kMouseDown), ("鼠标 ←", kMouseLeft), ("鼠标 →", kMouseRight),
         ("鼠标左键", kMouseClick), ("鼠标右键", kMouseRClick),
         ("滚轮 ↑", kScrollUp), ("滚轮 ↓", kScrollDown),
         ("锁定屏幕", kLockScreen), ("截屏后锁屏", kScreenshotAndLock), ("关机（确认）", kShutdownConfirm),
+        ("中断当前终端（⌃C）", kInterrupt),
     ]
     static func label(keycode: Int, cmd: Bool, shift: Bool, opt: Bool, ctrl: Bool) -> String {
         if keycode == kNone { return "（不映射 / 保持原键）" }
@@ -141,7 +142,7 @@ struct Config: Codable {
         let btns = known.map { k -> ButtonMapping in
             if let t = defaultTarget[k.usage] {
                 return ButtonMapping(usage: k.usage, name: k.name, keycode: t.0, cmd: t.1, shift: t.2, opt: t.3, ctrl: t.4,
-                                     longPressKeycode: k.usage == 0x66 ? KeyNames.kShutdownConfirm : nil)
+                                     longPressKeycode: k.usage == 0x66 ? KeyNames.kShutdownConfirm : (k.usage == 0x65 ? KeyNames.kInterrupt : nil))
             }
             return ButtonMapping(usage: k.usage, name: k.name)
         }
@@ -175,6 +176,13 @@ final class ConfigStore {
         // mapped at the HID layer to macOS's real Apple Globe/Fn usage so WeChat
         // IME receives a hardware-style Fn hold rather than a synthetic key event.
         cfg.voice = ButtonMapping(usage: -1, name: "语音键", keycode: 0x3F, cmd: false)
+        // Upgrade the original Menu → Esc default with a hold-to-interrupt action.
+        // Do not overwrite a user-selected long-press action.
+        if let menu = cfg.buttons.firstIndex(where: { $0.usage == 0x65 }),
+           cfg.buttons[menu].keycode == 0x35,
+           cfg.buttons[menu].longPressKeycode == nil {
+            cfg.buttons[menu].longPressKeycode = KeyNames.kInterrupt
+        }
         return cfg
     }
     static func save(_ cfg: Config) {

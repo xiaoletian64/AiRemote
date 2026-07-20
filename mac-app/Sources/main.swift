@@ -13,7 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 860, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
-        w.title = "MiVibeBoard"
+        w.title = "小米语音遥控器"
         w.contentView = NSHostingView(rootView: ContentView(e: engine))
         w.center()
         w.isReleasedWhenClosed = false

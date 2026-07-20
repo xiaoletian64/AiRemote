@@ -181,6 +181,8 @@ final class Engine: ObservableObject {
     private var longPressTimer: Timer?
     private var deleteRepeatTimer: Timer?
     private var longPressFired = false
+    private var deleteRepeatStartedAt: TimeInterval = 0
+    private var lastDeleteRepeatAt: TimeInterval = 0
     private var keyMonitor: Any?
 
     // event tap
@@ -230,6 +232,7 @@ final class Engine: ObservableObject {
         // BLE 初始化
         cm = CBCentralManager(delegate: proxy, queue: nil)
         installSessionObservers()
+        requestInitialPermissionsOnce()
 
         // HID 和音频等权限到位后再做，定时器会重试
         Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
@@ -251,6 +254,28 @@ final class Engine: ObservableObject {
                 } else {
                     self.audioWatchdog()
                 }
+            }
+        }
+    }
+
+    /// TCC permission requests are deliberately made at most once for a fresh
+    /// installation. Users can still revisit the Settings tab if they dismiss a
+    /// system prompt, but normal launches never create repeated prompts.
+    private func requestInitialPermissionsOnce() {
+        let key = "hasRequestedInitialPermissions"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        UserDefaults.standard.set(true, forKey: key)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self else { return }
+            if !AXIsProcessTrusted() {
+                _ = AXIsProcessTrustedWithOptions(
+                    [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                )
+                self.L("📌 已发起一次辅助功能授权请求")
+            }
+            if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+                IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+                self.L("📌 已发起一次输入监控授权请求")
             }
         }
     }
@@ -827,7 +852,10 @@ final class Engine: ObservableObject {
             deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
             if voiceHidDown { voiceHidDown = false; lastHidKeycodeAt[HIDMap.voiceKeycode] = now }
             if let t = downTarget {
-                if t.longPressKeycode != nil {
+                if t.usage == 0xF1 && t.keycode == 0x33 {
+                    // Backspace is emitted as complete taps, never as a held key.
+                    // This prevents macOS's own repeat curve from fighting ours.
+                } else if t.longPressKeycode != nil {
                     if !longPressFired { tapMapping(t) }
                 } else if t.keycode >= KeyNames.kSpecialBase { stopSpecial(t.keycode) }
                 else if t.keycode != KeyNames.kNone { postKey(CGKeyCode(t.keycode), down: false, cmd: false) }
@@ -856,6 +884,15 @@ final class Engine: ObservableObject {
         L(msg)
         self.flashKey(label: m.name, mapping: m.display)
         if m.keycode == KeyNames.kNone { downButtonUsage = Int(usage); downTarget = nil; return }
+        if Int(usage) == 0xF1 && m.keycode == 0x33 {
+            // One short press means exactly one deletion. Holding begins a
+            // separately controlled repeat curve after a short grace period.
+            postKey(0x33, down: true, cmd: false)
+            postKey(0x33, down: false, cmd: false)
+            downButtonUsage = Int(usage); downTarget = m
+            startDeleteRepeat()
+            return
+        }
         if let long = m.longPressKeycode {
             downButtonUsage = Int(usage); downTarget = m; longPressFired = false
             longPressTimer?.invalidate()
@@ -873,7 +910,6 @@ final class Engine: ObservableObject {
             startSpecial(m.keycode); downButtonUsage = Int(usage); downTarget = m; return
         }
         postKey(CGKeyCode(m.keycode), down: true, cmd: m.cmd, shift: m.shift, opt: m.opt, ctrl: m.ctrl)
-        if Int(usage) == 0xF1 && m.keycode == 0x33 { startDeleteRepeat() }
         downButtonUsage = Int(usage); downTarget = m
     }
 
@@ -891,11 +927,20 @@ final class Engine: ObservableObject {
 
     private func startDeleteRepeat() {
         deleteRepeatTimer?.invalidate()
+        deleteRepeatStartedAt = ProcessInfo.processInfo.systemUptime
+        lastDeleteRepeatAt = deleteRepeatStartedAt
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
             guard let self = self, self.downButtonUsage == 0xF1 else { return }
-            self.deleteRepeatTimer = Timer.scheduledTimer(withTimeInterval: 0.07, repeats: true) { [weak self] _ in
+            self.lastDeleteRepeatAt = ProcessInfo.processInfo.systemUptime
+            self.deleteRepeatTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     guard let self = self, self.downButtonUsage == 0xF1 else { return }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    let held = now - self.deleteRepeatStartedAt
+                    // 8 deletes/sec → 25 deletes/sec over roughly two seconds.
+                    let interval = max(0.04, 0.125 - min(0.085, max(0, held - 0.45) * 0.045))
+                    guard now - self.lastDeleteRepeatAt >= interval else { return }
+                    self.lastDeleteRepeatAt = now
                     self.postKey(0x33, down: true, cmd: false)
                     self.postKey(0x33, down: false, cmd: false)
                 }
@@ -1006,6 +1051,10 @@ final class Engine: ObservableObject {
             postKey(0x14, down: true, cmd: true, shift: true, opt: false, ctrl: false)
             postKey(0x14, down: false, cmd: false)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in self?.lockScreen() }
+        case KeyNames.kInterrupt:
+            postKey(0x08, down: true, cmd: false, ctrl: true) // ⌃C
+            postKey(0x08, down: false, cmd: false)
+            L("→ 已发送终端中断 ⌃C")
         case KeyNames.kShutdownConfirm:
             confirmShutdown()
         default:
