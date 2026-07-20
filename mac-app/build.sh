@@ -4,9 +4,9 @@
 set -e
 cd "$(dirname "$0")"
 
-APP_NAME="MiVibeBoard"
+APP_NAME="小米超级键盘"
 APP="build/${APP_NAME}.app"
-EXEC_NAME="MiVibeBoard"
+EXEC_NAME="MiKeyboard"
 
 # 解析参数
 DO_DMG=1
@@ -32,7 +32,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-# BlackHole 是系统音频驱动，刻意不嵌入 App：由用户通过 install.sh 或 Homebrew 安装。
+# BlackHole 驱动不内置（预编译包 License 不允许第三方重分发）。
+# App 在首次使用时从 Existential Audio 官方下载并用 sha256 校验后安装。
 
 # 版本号：git tag → v1.0.0；否则 1.0.0
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -83,15 +84,21 @@ if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
         | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' | head -1)
 fi
+# 兜底：任一可用本地代码签名证书（如 MenuBarToolkit Dev 等自签证书）。
+# 用它签名后 App 身份稳定（cdhash 固定），TCC 授权一次永久有效；ad-hoc 则每次重建都变。
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(.*\)"$/\1/p' | head -1)
+fi
 if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
     echo "→ 使用 Developer ID（可用于后续公证）: $SIGN_IDENTITY"
-    codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
 elif [ -n "$SIGN_IDENTITY" ]; then
-    echo "→ 使用稳定本机构建签名: $SIGN_IDENTITY"
-    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
+    echo "→ 使用稳定本机签名（身份固定，授权一次永久有效）: $SIGN_IDENTITY"
+    codesign --force --sign "$SIGN_IDENTITY" "$APP"
 else
-    echo "→ 未找到 Developer ID / Apple Development 证书，回退 ad-hoc 签名"
-    codesign --force --deep --sign - "$APP"
+    echo "→ 未找到任何签名证书，回退 ad-hoc 签名（每次重建身份会变，授权可能失效）"
+    codesign --force --sign - "$APP"
 fi
 
 # 也生成 zip（兼容性备用）
@@ -117,19 +124,39 @@ if [ "$DO_DMG" = "1" ]; then
     ln -s /Applications "$STAGING/Applications"
     # 简易 README
     cat > "$STAGING/README-安装说明.txt" <<'EOF'
-小米语音遥控器 - 安装说明
-========================
+小米超级键盘 - 安装说明
+======================
 
-1. 把「小米语音遥控器」拖到右侧的 Applications 文件夹
-2. 进入「应用程序」并打开它；首次启动时按系统提示允许权限
-3. 首次启动时按 App 提示授权：
-   - 辅助功能 (Accessibility)
-   - 输入监控 (Input Monitoring)
-4. 如要使用「按住语音键 → 系统麦克风输入」：
-   - 安装 BlackHole 2ch: brew install --cask blackhole-2ch
-   - App 会自动选择 BlackHole 2ch 为系统输入；无需重启 Mac
-5. 长按遥控器【主页】+【菜单】5 秒进入配对模式，App 自动连接
-6. 按遥控器按键 / 长按语音键开始用
+把小米/联想蓝牙语音遥控器变成 Mac 的无线键盘 + 麦克风。
+
+【安装】
+1. 把「小米超级键盘」拖到右侧的 Applications 文件夹
+2. 进入「应用程序」，【右键】→「打开」（首次直接双击会被 macOS 拦）
+3. 弹窗点「打开」
+
+【授权 - 必做，否则按键/锁屏不生效】
+打开 App 后，主界面顶部会出现橙色「一键授权」按钮，点它，
+然后在「系统设置 → 隐私与安全性」里把「小米超级键盘」勾上：
+  - 辅助功能 (Accessibility)        ← 按键映射、锁屏必需
+  - 输入监控 (Input Monitoring)     ← 读取遥控器按键必需
+  - 蓝牙 (Bluetooth)                ← 连接遥控器必需
+勾完【退出 App 再重新打开】一次，让权限生效。
+
+【语音转麦克风（可选）】
+如要把遥控器语音当 Mac 麦克风（用于听写/输入法/会议）：
+打开 App → 设置 → 「语音输入」→ 点「一键安装语音驱动」按钮
+→ App 自动从官方下载 BlackHole 驱动并校验 → 系统弹出密码框，输入管理员密码
+→ 安装完成后【重启 Mac】即可。
+（无需手动开终端或装 Homebrew）
+
+【配对遥控器】
+长按遥控器【主页】+【菜单】5 秒，指示灯快闪即进入配对模式，
+App 会自动发现并连接。多台遥控器时在主界面「遥控器」区点选当前要用的。
+
+【语音键两种模式】
+在「按键控制」页可切换语音键映射：
+  - 地球/Fn：系统听写原语，微信输入法等可识别
+  - 左 Control：作为修饰键，配合其它键发 Ctrl 组合
 
 卸载：直接拖到废纸篓即可。
 

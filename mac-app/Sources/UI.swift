@@ -8,6 +8,13 @@ struct ContentView: View {
 
     private var remoteReady: Bool { e.btOn && e.remoteConnected && e.handshakeReady }
     private var voiceReady: Bool { remoteReady && e.blackholeSelectedAsInput && e.hardwareGlobeReady }
+    /// 当前选中遥控器的显示名（无则返回占位）
+    private var currentRemoteName: String {
+        if let id = e.selectedRemoteID, let r = e.discoveredRemotes.first(where: { $0.id == id }) {
+            return r.name
+        }
+        return e.lastFoundName ?? "遥控器"
+    }
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -34,6 +41,7 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 header
+                permissionBanner
                 voiceHero
 
                 Text("连接状态")
@@ -41,7 +49,9 @@ struct ContentView: View {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
                     StatusCard(
                         title: "遥控器",
-                        detail: remoteReady ? "已连接，语音通道已就绪" : (e.btOn ? "正在等待遥控器" : "蓝牙未开启"),
+                        detail: remoteReady
+                            ? "已连接：\(currentRemoteName)"
+                            : (e.btOn ? "正在等待遥控器" : "蓝牙未开启"),
                         icon: "dot.radiowaves.left.and.right",
                         state: remoteReady ? .ready : .waiting
                     )
@@ -78,6 +88,31 @@ struct ContentView: View {
                     .background(Color.indigo.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
 
+                // 多遥控器选择区：列出已发现设备，单选切换当前活跃遥控器
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("遥控器").font(.headline)
+                        Spacer()
+                        if e.scanning { Text("正在扫描…").font(.caption).foregroundStyle(.secondary) }
+                        Button(e.scanning ? "扫描中" : "重新扫描") { e.retryScan() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(e.scanning)
+                    }
+                    if e.discoveredRemotes.isEmpty {
+                        Text("未发现遥控器。请长按遥控器【主页 + 菜单】5 秒进入配对模式，再点「重新扫描」。")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    } else {
+                        ForEach(e.discoveredRemotes) { remote in
+                            remoteRow(remote)
+                        }
+                    }
+                }
+                .padding(14)
+                .background(Color.indigo.opacity(0.05), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+
                 HStack {
                     Button(e.scanning ? "正在搜索遥控器…" : "重新连接遥控器") { e.retryScan() }
                         .buttonStyle(.borderedProminent)
@@ -93,10 +128,41 @@ struct ContentView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
+    /// 权限横幅：任一权限未授权时醒目提示，点击一键申请并跳转设置页。
+    @ViewBuilder
+    private var permissionBanner: some View {
+        if !allPermissionsGranted {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .font(.title2).foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("需要完成系统授权才能用按键控制").font(.headline)
+                    Text(permissionSummary)
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("一键授权") { e.requestAllPermissions() }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
+            .padding(14)
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+
+    private var allPermissionsGranted: Bool {
+        e.axTrusted && e.inputMonitoringOK
+    }
+    private var permissionSummary: String {
+        var missing: [String] = []
+        if !e.axTrusted { missing.append("辅助功能") }
+        if !e.inputMonitoringOK { missing.append("输入监控") }
+        return missing.isEmpty ? "全部已授权" : "未授权：" + missing.joined(separator: "、")
+    }
+
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 5) {
-                Text("MiVibeBoard")
+                Text("小米超级键盘")
                     .font(.system(size: 30, weight: .bold, design: .rounded))
                 Text("小米蓝牙语音遥控器 · Mac 语音与快捷控制")
                     .foregroundStyle(.secondary)
@@ -139,7 +205,9 @@ struct ContentView: View {
                 } else if !e.voiceFailure.isEmpty {
                     Text(e.voiceFailure).foregroundStyle(.orange)
                 } else {
-                    Text("语音键会保持原生 Fn / Globe，微信输入法可直接识别。")
+                    Text(e.config.voiceMode == .leftControl
+                         ? "语音键映射为左 Control 修饰键，按住可与其它键组成 Ctrl 快捷键。"
+                         : "语音键保持原生 Fn / Globe，微信输入法可直接识别。")
                         .foregroundStyle(.secondary)
                 }
                 Label("松开语音键即停止", systemImage: "hand.raised")
@@ -163,7 +231,7 @@ struct ContentView: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("按键控制") .font(.title2.bold())
-                    Text("兼容小米 BLE 遥控器的两种 HID 报告格式。语音键固定为原生 Fn；其他键可录制 Mac 快捷键或选择系统动作。")
+                    Text("兼容小米 BLE 遥控器的多种 HID 报告格式。语音键可在「地球/Fn」与「左 Control」间切换；其他键可录制 Mac 快捷键或选择系统动作。")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -177,8 +245,20 @@ struct ContentView: View {
                     HStack(spacing: 12) {
                         Image(systemName: "mic.fill").foregroundStyle(.indigo).frame(width: 24)
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("语音键  →  Fn（原生 Globe/Fn）").font(.body.weight(.medium))
-                            Text(e.hardwareGlobeReady ? "已启用，微信输入法可以识别" : "遥控器连接后会自动启用")
+                            Text("语音键映射模式").font(.body.weight(.medium))
+                            Picker("", selection: Binding(
+                                get: { e.config.voiceMode },
+                                set: { e.setVoiceMode($0) }
+                            )) {
+                                ForEach(VoiceMode.allCases, id: \.self) { mode in
+                                    Text(mode.label).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            Text(e.config.voiceMode.detail)
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text(e.hardwareGlobeReady ? "✓ 设备层映射已启用" : "遥控器连接后会自动启用")
                                 .font(.caption).foregroundStyle(e.hardwareGlobeReady ? .green : .secondary)
                         }
                         Spacer()
@@ -188,6 +268,7 @@ struct ContentView: View {
                         ))
                         .toggleStyle(.switch)
                         .labelsHidden()
+                        .help("把遥控器采集的语音转发到 BlackHole，作为系统麦克风输入")
                     }
                     .padding(.vertical, 5)
                 }
@@ -245,6 +326,36 @@ struct ContentView: View {
             }
         }
         .padding(.vertical, 5)
+    }
+
+    /// 遥控器候选行：名称 + RSSI + 连接状态，点击切换为当前设备。
+    @ViewBuilder
+    private func remoteRow(_ remote: RemoteCandidate) -> some View {
+        let isSelected = e.selectedRemoteID == remote.id
+        Button {
+            e.selectRemote(remote.id)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(isSelected ? .indigo : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(remote.name).font(.body.weight(.medium))
+                    Text(remote.connected ? "已连接" : (remote.rssi != 0 ? "RSSI \(remote.rssi) dBm" : "点击连接"))
+                        .font(.caption).foregroundStyle(remote.connected ? .green : .secondary)
+                }
+                Spacer()
+                if remote.connected {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                }
+            }
+            .contentShape(Rectangle())
+            .padding(10)
+            .background(
+                (isSelected ? Color.indigo.opacity(0.12) : Color.clear),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private func icon(for usage: Int) -> String {
@@ -306,9 +417,19 @@ struct ContentView: View {
                         )
                         if !e.blackholeFound {
                             Divider().padding(.leading, 42)
-                            HStack(alignment: .top, spacing: 10) {
-                                Image(systemName: "info.circle").foregroundStyle(.secondary)
-                                Text("安装 BlackHole 2ch 后，重新打开此应用即可自动选择。应用不会安装驱动或索取管理员密码。")
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 10) {
+                                    Button(e.blackholeInstalling ? "正在安装…" : "一键安装语音驱动") {
+                                        e.installBlackHole()
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                                    .disabled(e.blackholeInstalling)
+                                    if e.blackholeInstalling {
+                                        ProgressView().controlSize(.small)
+                                    }
+                                }
+                                Text("BlackHole 是系统级音频驱动。点击后系统会弹出密码框，请输入管理员密码；安装完成需要【重启 Mac】才能生效。")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             .padding(.top, 12)

@@ -121,6 +121,15 @@ final class Ring {
 // magic marker so our own synthetic CGEvents are ignored by our tap
 let kSyntheticMarker: Int64 = 0x4D49_5245  // "MIRE"
 
+/// 发现到的遥控器候选项（UI 展示用，不含 CBPeripheral 本身）。
+/// Identifiable 让 ForEach 直接用；id 即 peripheral.identifier，与 selectedRemoteID 对齐。
+struct RemoteCandidate: Identifiable, Hashable {
+    let id: UUID
+    var name: String
+    var rssi: Int
+    var connected: Bool   // 是否是当前活跃连接（dev）
+}
+
 @MainActor
 final class Engine: ObservableObject {
     // status published to UI
@@ -144,6 +153,10 @@ final class Engine: ObservableObject {
     @Published var scanning = false
     @Published var lastFoundName: String? = nil
     @Published var lastRSSI: Int = 0
+    // 多遥控器：发现的候选设备列表 + 当前选中。单选语义——同时只连一台。
+    // CBPeripheral 不直接进 SwiftUI，所以这里只暴露 id/name/rssi，用 id 去 discoveredPeripherals 取连接对象。
+    @Published var discoveredRemotes: [RemoteCandidate] = []
+    @Published var selectedRemoteID: UUID? = nil
     // 前台弹窗用：最新按键事件显示 + 触发抖动 token
     @Published var lastKeyLabel: String = "—"
     @Published var lastKeyMapping: String = ""
@@ -165,6 +178,8 @@ final class Engine: ObservableObject {
     private var dev: CBPeripheral?
     private var tx: CBCharacteristic?
     private var capsSent = false
+    // 多候选：按 peripheral.identifier 缓存发现到的设备对象，供 selectRemote 连接使用。
+    private var discoveredPeripherals: [UUID: CBPeripheral] = [:]
     private var streaming = false
     private var lastVoicePacketAt: TimeInterval = 0
     private var systemSuspended = false
@@ -201,9 +216,9 @@ final class Engine: ObservableObject {
 
     static let logFile: FileHandle? = {
         let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/MiVibeBoard", isDirectory: true)
+            .appendingPathComponent("Logs/小米超级键盘", isDirectory: true)
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
-        let url = logs.appendingPathComponent("mivibeboard.log")
+        let url = logs.appendingPathComponent("superkeyboard.log")
         FileManager.default.createFile(atPath: url.path, contents: nil)
         guard let handle = try? FileHandle(forWritingTo: url) else { return nil }
         try? handle.truncate(atOffset: 0)
@@ -211,7 +226,7 @@ final class Engine: ObservableObject {
         return handle
     }()
     func L(_ s: String) {
-        NSLog("[MiVibeBoard] %@", s)
+        NSLog("[小米超级键盘] %@", s)
         Engine.logFile?.write((s + "\n").data(using: .utf8)!)
         log.append(s); if log.count > 200 { log.removeFirst(log.count - 200) }
     }
@@ -358,13 +373,27 @@ final class Engine: ObservableObject {
     }
 
     private func applyVoiceGlobeMapping() {
-        let applied = voiceGlobeMapper.apply()
+        let mode = config.voiceMode
+        let applied = voiceGlobeMapper.apply(mode)
         if applied != hardwareGlobeReady {
             hardwareGlobeReady = applied
+            let target = mode == .leftControl ? "左 Control" : "Apple Globe/Fn"
             L(applied
-                ? "✅ 语音键硬件映射已启用：F5 → Apple Globe/Fn"
-                : "等待小米遥控器 HID 服务，以启用硬件 Globe/Fn 映射")
+                ? "✅ 语音键硬件映射已启用：F5 → \(target)"
+                : "等待小米遥控器 HID 服务，以启用语音键 \(target) 映射")
         }
+    }
+
+    /// 切换语音键 HID 重映射目标（Globe / 左 Control）。重新应用设备层映射并保存配置。
+    func setVoiceMode(_ mode: VoiceMode) {
+        guard config.voiceMode != mode else { return }
+        config.voiceMode = mode
+        // 先恢复成"应用前"状态，再用新模式重写，避免旧目标残留
+        voiceGlobeMapper.restore()
+        hardwareGlobeReady = false
+        applyVoiceGlobeMapping()
+        saveConfig()
+        L("语音键模式已切换为 \(mode.label)")
     }
 
     // ---------- keyboard capture (record a target key) ----------
@@ -487,6 +516,90 @@ final class Engine: ObservableObject {
         else if !blackholeFound && !was { L("⚠️ BlackHole 未检测到；语音不会送入系统输入") }
     }
 
+    /// 一键安装 BlackHole 2ch 驱动（UI「安装语音驱动」按钮调用）。
+    /// BlackHole 是内核态音频驱动，必须装到 /Library/Audio/Plug-Ins/HAL（系统目录），
+    /// 所以需要管理员密码 + 安装后重启 Mac。这两步是 macOS 硬要求，App 无法绕过。
+    ///
+    /// 合规说明：BlackHole 预编译包 License 不允许第三方重分发，所以 App 不内置 pkg，
+    /// 而是运行时从 Existential Audio 官方下载，并用 brew 记录的官方 sha256 校验完整性，
+    /// 确保下载内容未被篡改，再调用系统 installer 安装。
+    @Published var blackholeInstalling = false
+    private static let blackholePkgURL = "https://existential.audio/downloads/BlackHole2ch-0.7.1.pkg"
+    private static let blackholePkgSHA256 = "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf"
+    func installBlackHole() {
+        guard !blackholeFound else {
+            L("BlackHole 已安装，无需重复安装")
+            return
+        }
+        blackholeInstalling = true
+        L("📦 正在从官方下载 BlackHole 2ch 驱动…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 1) 下载官方 pkg 到临时目录
+            let tmpPkg = "/tmp/BlackHole2ch-\(ProcessInfo.processInfo.processIdentifier).pkg"
+            let fm = FileManager.default
+            try? fm.removeItem(atPath: tmpPkg)
+            let downloadTask = Process()
+            downloadTask.launchPath = "/usr/bin/curl"
+            downloadTask.arguments = ["-sL", "--fail", "--max-time", "60",
+                                      "-o", tmpPkg, Self.blackholePkgURL]
+            let dlPipe = Pipe()
+            downloadTask.standardError = dlPipe
+            do { try downloadTask.run(); downloadTask.waitUntilExit() } catch {
+                DispatchQueue.main.async { self.finishBlackHoleInstall(false, "下载失败：\(error.localizedDescription)") }
+                return
+            }
+            guard downloadTask.terminationStatus == 0 else {
+                let err = String(data: dlPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "?"
+                DispatchQueue.main.async { self.finishBlackHoleInstall(false, "下载失败（网络？）：\(err)") }
+                return
+            }
+            // 2) 校验 sha256（防止下载内容被篡改）
+            let shaTask = Process()
+            shaTask.launchPath = "/usr/bin/shasum"
+            shaTask.arguments = ["-a", "256", tmpPkg]
+            let shaPipe = Pipe()
+            shaTask.standardOutput = shaPipe
+            do { try shaTask.run(); shaTask.waitUntilExit() } catch {
+                DispatchQueue.main.async { self.finishBlackHoleInstall(false, "校验启动失败") }
+                return
+            }
+            let shaOut = String(data: shaPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let actual = shaOut.split(separator: " ").first.map(String.init) ?? ""
+            guard actual == Self.blackholePkgSHA256 else {
+                DispatchQueue.main.async { self.finishBlackHoleInstall(false, "校验失败：下载内容与官方 sha256 不符（\(actual)），已中止安装") }
+                return
+            }
+            // 3) 用 osascript 弹管理员密码框，调系统 installer 安装
+            DispatchQueue.main.async { self.L("✓ 下载校验通过，请输入管理员密码完成安装…") }
+            let script = "do shell script \"/usr/sbin/installer -pkg \\\"\(tmpPkg)\\\" -target /\" with administrator privileges"
+            let instTask = Process()
+            instTask.launchPath = "/usr/bin/osascript"
+            instTask.arguments = ["-e", script]
+            let instPipe = Pipe()
+            instTask.standardOutput = instPipe
+            instTask.standardError = instPipe
+            do { try instTask.run(); instTask.waitUntilExit() } catch {
+                DispatchQueue.main.async { self.finishBlackHoleInstall(false, "安装启动失败：\(error.localizedDescription)") }
+                return
+            }
+            let status = instTask.terminationStatus
+            let output = String(data: instPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            try? fm.removeItem(atPath: tmpPkg)   // 清理临时 pkg
+            DispatchQueue.main.async {
+                self.finishBlackHoleInstall(status == 0, status == 0 ? "" : "安装失败（可能取消了密码框）：\(output)")
+            }
+        }
+    }
+    private func finishBlackHoleInstall(_ success: Bool, _ failure: String) {
+        blackholeInstalling = false
+        if success {
+            L("✅ BlackHole 驱动已安装。请【重启 Mac】后语音转麦克风功能才能生效。")
+            checkBlackHole()
+        } else {
+            L("❌ \(failure)")
+        }
+    }
+
     /// The app produces audio into BlackHole, so selecting it as the system input is
     /// required for Dictation and input methods to receive the remote microphone.
     func selectBlackHoleAsSystemInput() {
@@ -538,6 +651,31 @@ final class Engine: ObservableObject {
         if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
             IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
             L("📌 已请求输入监控权限；请在系统设置中允许本 App")
+        }
+        checkPermissions()
+    }
+    /// 一次性申请所有未授权的权限（UI"一键授权"调用）。
+    /// 对每项独立判断：未授权才请求，已授权则跳过。macOS 对同一 App 每项权限最多主动弹一次，
+    /// 若之前拒绝过则请求会被系统静默忽略——此时打开系统设置页让用户手动开启。
+    func requestAllPermissions() {
+        var requested: [String] = []
+        if !AXIsProcessTrusted() {
+            _ = AXIsProcessTrustedWithOptions(
+                [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+            requested.append("辅助功能")
+        }
+        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+            IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+            requested.append("输入监控")
+        }
+        if requested.isEmpty {
+            L("✅ 所有权限均已授权")
+        } else {
+            L("📌 已请求授权：" + requested.joined(separator: "、") + "；请在系统设置中允许本 App")
+            // 请求发出后打开系统设置页，方便用户直接勾选（尤其之前拒绝过、系统不再弹窗的情况）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+            }
         }
         checkPermissions()
     }
@@ -692,52 +830,150 @@ final class Engine: ObservableObject {
     func startSearching() {
         guard !systemSuspended, let c = cm, c.state == .poweredOn else { return }
         let generation = reconnectGeneration
-        // 1) 优先看是否已在系统蓝牙里配对过（按多个服务 UUID 逐个 try）
-        //    小米遥控器配对后会与系统持有 HID(0x1812)/Battery(0x180F) 持续连接
+        // 1) 枚举所有系统已配对/已连接的遥控器，全部加入候选列表（不再 .first 抢一台）。
+        //    小米/联想遥控器配对后会与系统持有 HID(0x1812)/Battery(0x180F) 持续连接。
         for svc in seed {
-            if let d = c.retrieveConnectedPeripherals(withServices: [svc]).first {
-                dev = d; d.delegate = proxy; capsSent = false; c.connect(d, options: nil)
-                L("🔗 已连接系统配对的遥控器: \(d.name ?? "?") (via service \(svc.uuidString))")
-                return
+            for d in c.retrieveConnectedPeripherals(withServices: [svc]) {
+                addCandidate(d, rssi: 0, via: "system/\(svc.uuidString)")
             }
         }
-        // 2) 否则主动扫描，按名字匹配
-        if !scanning {
-            scanning = true
-            lastFoundName = nil
-            c.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
-            L("🎧 正在扫描小米蓝牙语音遥控器…")
-            L("💡 提示：长按遥控器【主页+菜单】5秒，指示灯快闪即进入配对模式")
-            // 30 秒内没找到就停止扫描
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-                guard let s = self, s.scanning, !s.systemSuspended,
-                      s.reconnectGeneration == generation else { return }
-                s.cm?.stopScan(); s.scanning = false
+        // 2) 若已有候选，按选中项（或默认首选）连接；否则启动主动扫描继续发现。
+        if discoveredRemotes.isEmpty {
+            startScan(generation: generation)
+        } else {
+            connectSelectedIfNeeded()
+            // 同时继续扫一小会，把没配对的设备也捞进来（比如刚进入配对模式的新遥控器）
+            if !scanning { startScan(generation: generation) }
+        }
+    }
+
+    private func startScan(generation: Int) {
+        guard let c = cm, !scanning else { return }
+        scanning = true
+        c.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        L("🎧 正在扫描蓝牙语音遥控器…")
+        L("💡 提示：长按遥控器【主页+菜单】5秒，指示灯快闪即进入配对模式")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let s = self, s.scanning, !s.systemSuspended,
+                  s.reconnectGeneration == generation else { return }
+            s.cm?.stopScan(); s.scanning = false
+            if s.discoveredRemotes.isEmpty {
                 s.L("⚠️ 30 秒内未发现遥控器，将在 3 秒后重试。")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                     guard let self, self.reconnectGeneration == generation, !self.systemSuspended else { return }
                     self.startSearching()
                 }
+            } else {
+                s.L("扫描结束，共发现 \(s.discoveredRemotes.count) 个候选遥控器")
             }
         }
     }
+
+    /// 设备显示名覆盖。某些遥控器的广播名不直观（如 "XiaoxinM2Pro BT"），
+    /// 按原始名映射成用户更易识别的名字。匹配用小写子串，兼容大小写差异。
+    /// - "小米蓝牙语音遥控器"（小米 RC003/2Pro，VID 0x2717）→ 小米蓝牙遥控器2 Pro
+    /// - "XiaoxinM2Pro BT"（联想，VID 0x17EF）→ 小米蓝牙语音遥控器
+    static func displayName(for rawName: String) -> String {
+        let n = rawName.lowercased()
+        // 先匹配联想那台（"xiaoxin" 是更独特的标记），避免和小米那台混。
+        if n.contains("xiaoxin") || n.contains("m2pro") { return "小米蓝牙语音遥控器" }
+        if n.contains("小米蓝牙") || n.contains("xiaomi") { return "小米蓝牙遥控器2 Pro" }
+        return rawName
+    }
+
+    /// 把发现到的设备加入候选列表（按 identifier 去重），并缓存 CBPeripheral 供连接用。
+    private func addCandidate(_ p: CBPeripheral, rssi: Int, via: String) {
+        let id = p.identifier
+        let rawName = p.name ?? "未知遥控器"
+        let name = Self.displayName(for: rawName)
+        let isFirst = discoveredPeripherals.isEmpty
+        discoveredPeripherals[id] = p
+        if let i = discoveredRemotes.firstIndex(where: { $0.id == id }) {
+            discoveredRemotes[i].name = name
+            if rssi != 0 { discoveredRemotes[i].rssi = rssi }
+            discoveredRemotes[i].connected = (dev?.identifier == id)
+        } else {
+            discoveredRemotes.append(RemoteCandidate(id: id, name: name, rssi: rssi, connected: dev?.identifier == id))
+            L("📡 发现遥控器: \(name) (RSSI \(rssi)dBm, via \(via))")
+        }
+        // 首次发现且用户尚未选择时，默认选第一台（保持开箱即用）
+        if selectedRemoteID == nil {
+            // 优先恢复上次持久化的选择（系统配对设备 identifier 跨重启稳定）
+            if isFirst, let saved = UserDefaults.standard.string(forKey: "selectedRemoteID"),
+               let savedID = UUID(uuidString: saved) {
+                selectedRemoteID = savedID
+            }
+            // 若保存的选择不在当前候选中，或没有保存过，则选首个
+            if selectedRemoteID == nil || !discoveredPeripherals.keys.contains(selectedRemoteID!) {
+                if isFirst { selectedRemoteID = id }
+            }
+        }
+    }
+
+    /// 连接当前选中设备（若未选中则选首个）。仅在未连接或连接的不是目标时才连。
+    private func connectSelectedIfNeeded() {
+        guard let c = cm else { return }
+        let target = selectedRemoteID ?? discoveredRemotes.first?.id
+        guard let id = target, let p = discoveredPeripherals[id] else { return }
+        if let cur = dev, cur.identifier == id, remoteConnected { return }   // 已是目标且已连接
+        if let cur = dev, cur.identifier != id {
+            cm.cancelPeripheralConnection(cur)   // 切换：先断旧设备
+        }
+        dev = p; p.delegate = proxy; capsSent = false; tx = nil
+        handshakeReady = false
+        c.connect(p, options: nil)
+        // 刷新各候选的 connected 标记
+        for i in discoveredRemotes.indices {
+            discoveredRemotes[i].connected = (p.identifier == discoveredRemotes[i].id)
+        }
+        L("🔗 连接遥控器: \(Self.displayName(for: p.name ?? "?"))")
+    }
+
+    /// 手动切换当前遥控器（UI 调用）。
+    func selectRemote(_ id: UUID) {
+        guard selectedRemoteID != id || dev?.identifier != id else { return }
+        selectedRemoteID = id
+        // 持久化选择：系统配对设备的 identifier 跨重启稳定，下次启动自动回连同一台
+        UserDefaults.standard.set(id.uuidString, forKey: "selectedRemoteID")
+        // 清掉旧连接的 ATVV 状态，避免错位
+        if let cur = dev, cur.identifier != id {
+            cm.cancelPeripheralConnection(cur)
+            dev = nil; tx = nil; capsSent = false
+            handshakeReady = false; streaming = false; micStreaming = false
+        }
+        connectSelectedIfNeeded()
+    }
+
     // 防御性：连接失败也重连
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        L("⚠️ 连接失败: \(error?.localizedDescription ?? "?")，3 秒后重试。")
+        L("⚠️ 连接失败: \(Self.displayName(for: p.name ?? "?")) \(error?.localizedDescription ?? "?")，3 秒后重试。")
+        // 连接失败时把候选标记为未连接
+        if let i = discoveredRemotes.firstIndex(where: { $0.id == p.identifier }) {
+            discoveredRemotes[i].connected = false
+        }
         let generation = reconnectGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, self.reconnectGeneration == generation, !self.systemSuspended else { return }
-            self.startSearching()
+            self.connectSelectedIfNeeded()
         }
     }
-    func retryScan() { recoverAfterSessionChange(reason: "手动重新连接") }
+    func retryScan() {
+        // 手动重新扫描：清候选后重新发现，保留 selectedRemoteID 以便回连原选择
+        discoveredRemotes.removeAll(); discoveredPeripherals.removeAll()
+        if let cur = dev { cm?.cancelPeripheralConnection(cur) }
+        dev = nil; tx = nil; capsSent = false
+        remoteConnected = false; handshakeReady = false; streaming = false; micStreaming = false
+        recoverAfterSessionChange(reason: "手动重新连接")
+    }
     fileprivate func didDiscover(_ p: CBPeripheral, rssi: Int) {
-        // 第一个匹配的就停止扫描、连接
-        cm.stopScan(); scanning = false
+        // 不再"找到第一个就停"：加入候选列表，扫描继续，让用户能在 UI 看到所有设备。
+        addCandidate(p, rssi: rssi, via: "scan")
         lastFoundName = p.name ?? "?"
         lastRSSI = rssi
-        L("📡 发现 \(p.name ?? "遥控器") (RSSI \(rssi)dBm)，正在连接…")
-        dev = p; p.delegate = proxy; capsSent = false; cm.connect(p, options: nil)
+        // 若尚未连接任何设备，且这是当前选中（或默认首选），尝试连接
+        if dev == nil || (!remoteConnected && dev?.identifier != selectedRemoteID) {
+            connectSelectedIfNeeded()
+        }
     }
     fileprivate func didConnect(_ p: CBPeripheral) { remoteConnected = true; p.discoverServices([ATVV]) }
     fileprivate func didDisconnect() {
@@ -808,7 +1044,10 @@ final class Engine: ObservableObject {
         }
     }
     private func voiceButton(down: Bool) {
+        // 两种模式都通过 HID 设备层重映射（F5 → Globe 或 LeftControl），这里不再发合成键。
+        // config.voice.keycode 固定 0x3F，仅用于 v.display 文案；真正的按键行为由 voiceMode 决定。
         let v = config.voice
+        let modeLabel = config.voiceMode == .leftControl ? "左 Control" : v.display
         // BLE 通道也标记语音键状态：与 HID 报告双保险，谁先到谁立标记，确保原生 F5 被吞
         voiceHidDown = down
         lastHidKeycodeAt[HIDMap.voiceKeycode] = ProcessInfo.processInfo.systemUptime
@@ -817,18 +1056,14 @@ final class Engine: ObservableObject {
             codec.reset(); dsp.reset(); streaming = true
             micStreaming = config.voiceStartsMic && blackholeFound && blackholeSelectedAsInput
             voicePacketCount = 0; voiceBytesReceived = 0; voiceFailure = ""
-            if v.keycode >= KeyNames.kSpecialBase { startSpecial(v.keycode) }
-            // The remote's own F5 is now an actual Apple Globe/Fn HID event.
-            // Never add a synthetic Fn on top of it: WeChat IME rejects that
-            // synthetic event and it would also create duplicate transitions.
-            else if v.keycode != 0x3F && v.keycode != KeyNames.kNone { postKey(CGKeyCode(v.keycode), down: true, cmd: v.cmd, shift: v.shift, opt: v.opt, ctrl: v.ctrl) }
+            // 按键已由 HID 重映射处理，此处只管音频流；不再 postKey，避免和重映射重复。
             if !handshakeReady {
                 voiceFailure = "ATVV 尚未握手完成"
                 sendATVVCaps(force: true)
             } else if config.voiceStartsMic && !micStreaming {
                 voiceFailure = "BlackHole 未就绪，音频只做接收诊断，不会转发"
             }
-            L("🎤 语音键按下 → \(v.display)\(micStreaming ? " + 麦克风转发" : "")")
+            L("🎤 语音键按下 → \(modeLabel)\(micStreaming ? " + 麦克风转发" : "")")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 guard let self, self.streaming, self.voicePacketCount == 0 else { return }
                 self.voiceFailure = "未收到音频帧，正在重试 ATVV 握手"
@@ -837,8 +1072,7 @@ final class Engine: ObservableObject {
             }
         } else {
             streaming = false; micStreaming = false
-            if v.keycode >= KeyNames.kSpecialBase { stopSpecial(v.keycode) }
-            else if v.keycode != 0x3F && v.keycode != KeyNames.kNone { postKey(CGKeyCode(v.keycode), down: false, cmd: false) }
+            // 按键由 HID 重映射处理，松开时同样不发合成键；这里只停止音频流。
             L("语音键松开")
         }
     }
@@ -848,11 +1082,22 @@ final class Engine: ObservableObject {
         guard hidMgr == nil else { return }
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else { return }
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, 0)
-        // Xiaomi uses the same vendor ID across several Bluetooth remote models.
-        // Do not lock this path to one product ID; reports are accepted only when
-        // they contain a known remote usage, so unrelated Xiaomi HID devices are
-        // left untouched.
-        IOHIDManagerSetDeviceMatching(mgr, [kIOHIDVendorIDKey: 0x2717] as CFDictionary)
+        // 小米多个蓝牙遥控器型号共用 VID 0x2717，但联想 XiaoxinM2Pro 等第三方语音遥控器用 VID 0x17EF。
+        // 用"已知 VID + 名称匹配"两套匹配字典，覆盖更广。
+        // 安全性由 handleHIDReport 保证：只处理含已知 usage 的报告，其它设备的报告一律放行。
+        var matches: [[String: Any]] = [
+            [kIOHIDVendorIDKey: 0x2717],   // 小米
+            [kIOHIDVendorIDKey: 0x17EF],   // 联想（XiaoxinM2Pro BT）
+        ]
+        let nameKeywords = ["遥控", "remote", "mitv", "mi tv", "xiaomi", "xiaoxin", "m2pro", "aibao", "语音"]
+        // 名称匹配：PrimaryUsage 0x07(Keyboard)/0x0C(Consumer) + 产品名命中关键字
+        for kw in nameKeywords {
+            matches.append([
+                kIOHIDProductKey: kw,
+                kIOHIDPrimaryUsagePageKey: 0x01,   // Generic Desktop（多数遥控器顶层描述符）
+            ])
+        }
+        IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
         let openRes = IOHIDManagerOpen(mgr, 0)
         guard openRes == kIOReturnSuccess else {
@@ -860,13 +1105,33 @@ final class Engine: ObservableObject {
             return
         }
         guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
-            L("⚠️ IOHID 未发现小米遥控器（Vendor 0x2717），稍后自动重试")
+            L("⚠️ IOHID 未发现小米遥控器，稍后自动重试")
             // 没找到设备时不持久化 hidMgr，让定时器可以重试
             return
         }
         inputMonitoringOK = true
-        L("✅ HID 找到 \(set.count) 个小米设备")
+        // 同一物理设备会暴露多个 HID 接口（键盘 + 消费控制），枚举时按 (VID,PID,名称) 去重，
+        // 并排除 Apple 内建键盘/触控板（VID 0x05AC）等非遥控器设备，避免日志刷屏和误注册回调。
+        var seen = Set<String>()
+        var remoteDevices: [IOHIDDevice] = []
         for dvc in set {
+            let name = (IOHIDDeviceGetProperty(dvc, kIOHIDProductKey as CFString) as? String) ?? "?"
+            let vid = (IOHIDDeviceGetProperty(dvc, kIOHIDVendorIDKey as CFString) as? NSNumber)?.intValue ?? 0
+            let pid = (IOHIDDeviceGetProperty(dvc, kIOHIDProductIDKey as CFString) as? NSNumber)?.intValue ?? 0
+            // 排除 Apple 内建设备（键盘/触控板），它们不是遥控器
+            if vid == 0x05AC { continue }
+            let key = "\(vid):\(pid):\(name)"
+            if seen.contains(key) { continue }
+            seen.insert(key)
+            remoteDevices.append(dvc)
+            L("📱 HID 设备: \(Self.displayName(for: name)) (VID 0x\(String(format:"%04X",vid)) PID 0x\(String(format:"%04X",pid)))")
+        }
+        guard !remoteDevices.isEmpty else {
+            L("⚠️ IOHID 未发现遥控器（已排除内建键盘），稍后自动重试")
+            return
+        }
+        L("✅ HID 找到 \(remoteDevices.count) 个遥控设备")
+        for dvc in remoteDevices {
             let rsize = (IOHIDDeviceGetProperty(dvc, kIOHIDMaxInputReportSizeKey as CFString) as? Int) ?? 64
             _ = IOHIDDeviceOpen(dvc, IOHIDOptionsType(kIOHIDOptionsTypeNone))
             let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: max(rsize,8)); hidBufs.append(buf)
@@ -908,8 +1173,8 @@ final class Engine: ObservableObject {
         } else if XiaomiRemoteHIDParser.isRelease(bytes) {
             hidReport(usage: 0)
         } else {
-            let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
-            L("未识别的 HID 报告: \(hex)")
+            // 解析失败：打印完整 hex + 每个非零双字节，便于把新出现的 usage 补进 Config.known
+            L("未识别的 HID 报告: \(XiaomiRemoteHIDParser.describe(bytes))")
         }
     }
 
@@ -1216,7 +1481,7 @@ final class Engine: ObservableObject {
     private let evSrc = CGEventSource(stateID: .hidSystemState)
     func postKey(_ code: CGKeyCode, down: Bool, cmd: Bool, shift: Bool = false, opt: Bool = false, ctrl: Bool = false) {
         guard AXIsProcessTrusted() else {
-            if code == 0x3F && down { L("❌ Fn 未发送：需要在系统设置中允许「小米语音遥控器」的辅助功能权限") }
+            if code == 0x3F && down { L("❌ Fn 未发送：需要在系统设置中允许「小米超级键盘」的辅助功能权限") }
             return
         }
         var flags: CGEventFlags = []
@@ -1259,7 +1524,7 @@ final class BTProxy: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) { Task { @MainActor in e?.centralManager(c, didFailToConnect: p, error: error) } }
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral, advertisementData d: [String : Any], rssi RSSI: NSNumber) {
         guard let name = (p.name ?? d[CBAdvertisementDataLocalNameKey] as? String)?.lowercased() else { return }
-        let keywords = ["小米蓝牙","遥控","语音","xiaomi","mi tv","mitv","mi remote","miremote","aibao"]
+        let keywords = ["小米蓝牙","遥控","语音","xiaomi","mi tv","mitv","mi remote","miremote","aibao","xiaoxin","m2pro","lenovo"]
         guard keywords.contains(where: { name.contains($0) }) else { return }
         Task { @MainActor in e?.didDiscover(p, rssi: RSSI.intValue) }
     }

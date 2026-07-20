@@ -4,9 +4,9 @@
 set -e
 cd "$(dirname "$0")"
 
-APP_NAME="MiVibeBoard"
+APP_NAME="小米超级键盘"
 
-echo "── 小米语音遥控器 · 安装向导 ──"
+echo "── 小米超级键盘 · 安装向导 ──"
 echo ""
 
 # 1) Homebrew
