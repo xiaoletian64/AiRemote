@@ -65,10 +65,25 @@ else
 fi
 
 # The remote itself supplies the native Globe/Fn event through a device-specific
-# HID mapping. No special Apple entitlement or provisioning profile is required.
+# HID mapping. Prefer an Apple identity so macOS sees one stable application
+# identity across updates and does not duplicate TCC entries.
 xattr -cr "$APP" 2>/dev/null || true
-echo "→ 使用 ad-hoc 签名"
-codesign --force --deep --sign - "$APP"
+SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-}"
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Apple Distribution:.*\)"/\1/p' | head -1)
+fi
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' | head -1)
+fi
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "→ 使用稳定 Apple 签名: $SIGN_IDENTITY"
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
+else
+    echo "→ 未找到 Apple 证书，回退 ad-hoc 签名"
+    codesign --force --deep --sign - "$APP"
+fi
 
 # 也生成 zip（兼容性备用）
 cd build
