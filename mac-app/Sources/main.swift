@@ -43,6 +43,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
+        if let button = item.button {
+            // A text label makes the app discoverable among macOS's many tiny
+            // menu-bar glyphs, especially when it is running without a Dock icon.
+            button.imagePosition = .imageLeading
+            button.font = .systemFont(ofSize: 12, weight: .medium)
+            button.title = " 遥控器"
+            button.setAccessibilityLabel("小米语音遥控器菜单")
+        }
         statusItem = item
     }
 
@@ -66,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "小米语音遥控器")
         button.image?.isTemplate = true
         let state = engine.micStreaming ? "正在语音" : (engine.remoteConnected ? "已连接" : "未连接")
+        button.title = engine.micStreaming ? " 语音中" : " 遥控器"
         button.toolTip = "小米语音遥控器：\(state)"
 
         if lastMenuBarOnly != engine.menuBarOnly {
