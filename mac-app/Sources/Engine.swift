@@ -63,42 +63,92 @@ struct Biquad {
         b.a1 = -2*cw/a0; b.a2 = (1 - al/A)/a0
         return b
     }
+    static func highshelf(f0: Float, fs: Float, q: Float, dbGain: Float) -> Biquad {
+        // RBJ high-shelf：在高频段整体抬升/衰减，用于增加空气感
+        let A = pow(10, dbGain/40)
+        let w = 2*Float.pi*f0/fs, cw = cos(w), al = sin(w)/(2*q)
+        let a0 = (A+1) - (A-1)*cw + 2*sqrt(A)*al
+        var b = Biquad()
+        b.b0 = (A*((A+1) + (A-1)*cw + 2*sqrt(A)*al))/a0
+        b.b1 = (-2*A*((A+1) - (A-1)*cw))/a0
+        b.b2 = (A*((A+1) + (A-1)*cw - 2*sqrt(A)*al))/a0
+        b.a1 = (2*((A-1) + (A+1)*cw))/a0
+        b.a2 = ((A+1) + (A-1)*cw - 2*sqrt(A)*al)/a0
+        return b
+    }
 }
 
 struct VoiceDSP {
-    var hp = Biquad.highpass(f0: 120, fs: 16000, q: 0.8)     // 滤低频噪声
-    var ls = Biquad.lowshelf(f0: 200, fs: 16000, q: 0.5, dbGain: -4)  // 压 200Hz 嗡嗡声
-    var eq = Biquad.peaking(f0: 2500, fs: 16000, q: 1.0, dbGain: 3)  // 提亮人声
+    // 频谱整形链：高通切低频嗡嗡 → 低shelf压200Hz → 中频提清晰度 → 高频提亮
+    // 高通从 120 提到 160Hz：蓝牙遥控器 + 室内环境低频噪声多在 80-200Hz，切更狠识别更干净。
+    var hp = Biquad.highpass(f0: 160, fs: 16000, q: 0.7)     // 滤低频噪声（切更狠）
+    var ls = Biquad.lowshelf(f0: 220, fs: 16000, q: 0.5, dbGain: -6)  // 压 200Hz 嗡嗡声（加深）
+    // 语音清晰度关键频段是 1-4kHz（辅音辨别，决定识别率）。原来只 2500Hz 单点 +3dB 不够，
+    // 改为两点：1500Hz 轻提（鼻音/元音饱满）+ 3000Hz 多提（辅音清晰）。
+    var eq1 = Biquad.peaking(f0: 1500, fs: 16000, q: 1.2, dbGain: 2)   // 中频饱满
+    var eq2 = Biquad.peaking(f0: 3000, fs: 16000, q: 1.0, dbGain: 4)   // 辅音清晰（提亮加强）
+    var hs = Biquad.highshelf(f0: 4000, fs: 16000, q: 0.7, dbGain: 3)  // 高频空气感
     var env: Float = 0
     var gate: Float = 0
     var gain: Float = 4
     var noiseFloor: Float = 0.0025
     var noiseMin: Float = 1.0
-    mutating func reset() { hp.reset(); ls.reset(); eq.reset(); env = 0; gate = 0; noiseFloor = 0.0025; noiseMin = 1.0 }
+    var dcOffset: Float = 0   // 直流偏移估计（ADPCM 解码可能残留，拉低 SNR 估计准确度）
+    // 宽频稳态噪声估计（谱减的简化版）：用短时能量跟踪背景噪声，语音活动时缓慢上推，
+    // 静音时快速下压。比原来的单 noiseFloor 更能压风扇/电流声这类全程噪声。
+    var noiseEst: Float = 0.002
+    mutating func reset() {
+        hp.reset(); ls.reset(); eq1.reset(); eq2.reset(); hs.reset()
+        env = 0; gate = 0; noiseFloor = 0.0025; noiseMin = 1.0; dcOffset = 0; noiseEst = 0.002
+    }
     mutating func process(_ xs: [Float]) -> [Float] {
         var out = [Float](); out.reserveCapacity(xs.count)
         for x0 in xs {
-            var x = eq.run(ls.run(hp.run(x0)))
-            env = max(abs(x), env * 0.999)
-            noiseMin = min(noiseMin, abs(x) + 1e-6)
-            if abs(x) < noiseFloor * 2 {
+            // 1) 去直流偏移（一阶高通的极低频等效，不影响语音）
+            dcOffset += (x0 - dcOffset) * 0.001
+            var x = x0 - dcOffset
+            // 2) 频谱整形链
+            x = hs.run(eq2.run(eq1.run(ls.run(hp.run(x)))))
+            let ax = abs(x)
+            env = max(ax, env * 0.999)
+            noiseMin = min(noiseMin, ax + 1e-6)
+            // 3) 宽频噪声估计：静音段快速学习，语音段缓慢遗忘
+            if ax < noiseFloor * 2 {
+                noiseEst += (ax - noiseEst) * 0.02   // 静音：快速逼近真实背景
+            } else {
+                noiseEst += (noiseEst - ax) * 0.0001 * 0   // 语音段：保持（不减）
+                noiseEst = max(noiseEst, ax * 0.15)         // 但不让它被瞬时尖峰拉太高
+            }
+            noiseEst = max(0.0003, min(0.02, noiseEst))
+            if ax < noiseFloor * 2 {
                 noiseFloor += (noiseMin - noiseFloor) * 0.001
             } else if env < noiseFloor * 4 {
                 noiseFloor += (0.0025 - noiseFloor) * 0.0001
             }
             noiseFloor = max(0.0003, min(0.008, noiseFloor))
             noiseMin = min(noiseMin + 0.00001, 1.0)
+            // 4) 宽频谱减：从信号里减去估计的噪声能量（过减则限幅，避免音乐噪声）
+            if ax > noiseEst * 1.5 {
+                let overSub: Float = 1.5   // 过减系数，压更多噪声
+                let reduced = sqrt(max(0, ax * ax - (noiseEst * overSub) * (noiseEst * overSub)))
+                x *= reduced / max(ax, 1e-6)
+            } else {
+                x *= 0.1   // 纯噪声段大幅衰减
+            }
+            // 5) 噪声门。开启快（0.05，话头不丢），关闭慢（0.0008，句尾弱音不被门切断）。
+            // 之前关闭用 0.002 太快，会把"最后两个字"的尾音压没——这是吞尾字的主因之一。
             let snr = env / max(noiseFloor, 1e-6)
             let gateOpen: Float
-            if snr > 3.5 { gateOpen = 1.0 }
-            else if snr < 1.8 { gateOpen = 0.02 }
-            else { gateOpen = (snr - 1.8) / 1.7 * 0.98 + 0.02 }
-            let rate: Float = gateOpen > gate ? 0.05 : 0.0003
+            if snr > 3.0 { gateOpen = 1.0 }
+            else if snr < 1.5 { gateOpen = 0.02 }
+            else { gateOpen = (snr - 1.5) / 1.5 * 0.98 + 0.02 }
+            let rate: Float = gateOpen > gate ? 0.05 : 0.0008
             gate += (gateOpen - gate) * rate
             x *= gate
+            // 6) AGC（响应加快，避免句尾小音量词被压）
             if env > noiseFloor * 3 {
-                let desired = min(24, max(1, 0.25 / max(env, 1e-4)))
-                gain += (desired - gain) * 0.001
+                let desired = min(24, max(1, 0.3 / max(env, 1e-4)))
+                gain += (desired - gain) * 0.003   // 从 0.001 提到 0.003，跟得上句内起伏
             }
             out.append(tanh(x * gain))
         }
@@ -124,7 +174,9 @@ let kSyntheticMarker: Int64 = 0x4D49_5245  // "MIRE"
 /// 发现到的遥控器候选项（UI 展示用，不含 CBPeripheral 本身）。
 /// Identifiable 让 ForEach 直接用；id 即 peripheral.identifier，与 selectedRemoteID 对齐。
 struct RemoteCandidate: Identifiable, Hashable {
-    let id: UUID
+    // id 设为 var：同一物理设备在不同扫描轮次里 peripheral.identifier 可能变化，
+    // 按 name 合并去重时需要把 id 更新为最新句柄，保证 selectRemote 能取到有效 peripheral。
+    var id: UUID
     var name: String
     var rssi: Int
     var connected: Bool   // 是否是当前活跃连接（dev）
@@ -182,6 +234,7 @@ final class Engine: ObservableObject {
     private var discoveredPeripherals: [UUID: CBPeripheral] = [:]
     private var streaming = false
     private var lastVoicePacketAt: TimeInterval = 0
+    private var voiceSessionStartAt: TimeInterval = 0   // 本次语音键按下的起始时间，用于丢包统计
     private var systemSuspended = false
     private var reconnectGeneration = 0
     private var lastRecoveryAt: TimeInterval = 0
@@ -193,6 +246,11 @@ final class Engine: ObservableObject {
     private var lastHidKeycodeAt: [CGKeyCode: TimeInterval] = [:]
     private var voiceHidDown = false   // 语音键的 HID F5 正被按住（需持续吞掉）
     private var downButtonUsage: Int = 0
+    // 抖动检测：拿起遥控器/手指碰圆环时会产生密集且多变的 usage 切换（0xF1/0x28/0x51 混跳），
+    // 真实按键是单一 usage 持续保持。记录近期（200ms 内）出现的不同 usage 集合，
+    // 若短时间内切换 ≥3 种不同 usage，判定为抖动，忽略这批脉冲，避免误删除。
+    private var recentUsages: [(usage: Int, at: TimeInterval)] = []
+    private var bounceSuppressUntil: TimeInterval = 0   // 抖动抑制期，此期间忽略新的 down
     private var downTarget: ButtonMapping?
     private var longPressTimer: Timer?
     private var deleteRepeatTimer: Timer?
@@ -837,13 +895,11 @@ final class Engine: ObservableObject {
                 addCandidate(d, rssi: 0, via: "system/\(svc.uuidString)")
             }
         }
-        // 2) 若已有候选，按选中项（或默认首选）连接；否则启动主动扫描继续发现。
-        if discoveredRemotes.isEmpty {
+        // 2) 连接选中项。扫描只在"没有候选"或"用户手动要求重扫"时启动，
+        //    避免每次重连/恢复都触发 30 秒扫描，导致列表反复刷新和重复条目。
+        connectSelectedIfNeeded()
+        if discoveredRemotes.isEmpty && !scanning {
             startScan(generation: generation)
-        } else {
-            connectSelectedIfNeeded()
-            // 同时继续扫一小会，把没配对的设备也捞进来（比如刚进入配对模式的新遥控器）
-            if !scanning { startScan(generation: generation) }
         }
     }
 
@@ -888,10 +944,18 @@ final class Engine: ObservableObject {
         let name = Self.displayName(for: rawName)
         let isFirst = discoveredPeripherals.isEmpty
         discoveredPeripherals[id] = p
-        if let i = discoveredRemotes.firstIndex(where: { $0.id == id }) {
+        // 双重去重：同一台物理设备可能因系统配对枚举/扫描返回不同 identifier 的 CBPeripheral，
+        // 但显示名一致。用户视角下"同名就是同一台"，所以按 (id, name) 任一命中都视为已存在，
+        // 把新对象并入已有条目（更新 RSSI / peripheral 句柄），避免列表出现重复。
+        let byID = discoveredRemotes.firstIndex { $0.id == id }
+        let byName = discoveredRemotes.firstIndex { $0.name == name }
+        if let i = byID ?? byName {
             discoveredRemotes[i].name = name
             if rssi != 0 { discoveredRemotes[i].rssi = rssi }
-            discoveredRemotes[i].connected = (dev?.identifier == id)
+            // 已连接的条目保留 connected=true，不被新对象覆盖成 false
+            if dev?.identifier == id { discoveredRemotes[i].connected = true }
+            // 用最新的 peripheral 句柄（连接用），并让 id 字段与实际 dev 对齐
+            discoveredRemotes[i].id = id
         } else {
             discoveredRemotes.append(RemoteCandidate(id: id, name: name, rssi: rssi, connected: dev?.identifier == id))
             L("📡 发现遥控器: \(name) (RSSI \(rssi)dBm, via \(via))")
@@ -966,12 +1030,12 @@ final class Engine: ObservableObject {
         recoverAfterSessionChange(reason: "手动重新连接")
     }
     fileprivate func didDiscover(_ p: CBPeripheral, rssi: Int) {
-        // 不再"找到第一个就停"：加入候选列表，扫描继续，让用户能在 UI 看到所有设备。
+        // 加入候选列表（addCandidate 内部按 id/名称去重），扫描继续让用户能看到所有设备。
         addCandidate(p, rssi: rssi, via: "scan")
         lastFoundName = p.name ?? "?"
         lastRSSI = rssi
-        // 若尚未连接任何设备，且这是当前选中（或默认首选），尝试连接
-        if dev == nil || (!remoteConnected && dev?.identifier != selectedRemoteID) {
+        // 只在当前没有任何活跃连接时才尝试连接选中项，避免每个广播都触发断连重连。
+        if dev == nil || !remoteConnected {
             connectSelectedIfNeeded()
         }
     }
@@ -1039,6 +1103,8 @@ final class Engine: ObservableObject {
                 if micStreaming { ring.push(pcm) }
             }
         } else if ch.uuid == CTL, let f = d.first {
+            // 诊断：记录 CTL 通道收到的原始值，便于确认 Pro 语音键的按下/松开字节
+            L("CTL 通道收到: 0x\(String(format:"%02X", f)) (共 \(d.count) bytes: \(d.map{String(format:"%02X",$0)}.joined(separator:" ")))")
             if f == 0x04 { voiceButton(down: true) }
             else if f == 0x00 { voiceButton(down: false) }
         }
@@ -1056,6 +1122,7 @@ final class Engine: ObservableObject {
             codec.reset(); dsp.reset(); streaming = true
             micStreaming = config.voiceStartsMic && blackholeFound && blackholeSelectedAsInput
             voicePacketCount = 0; voiceBytesReceived = 0; voiceFailure = ""
+            voiceSessionStartAt = ProcessInfo.processInfo.systemUptime
             // 按键已由 HID 重映射处理，此处只管音频流；不再 postKey，避免和重映射重复。
             if !handshakeReady {
                 voiceFailure = "ATVV 尚未握手完成"
@@ -1071,9 +1138,30 @@ final class Engine: ObservableObject {
                 self.sendATVVCaps(force: true)
             }
         } else {
-            streaming = false; micStreaming = false
-            // 按键由 HID 重映射处理，松开时同样不发合成键；这里只停止音频流。
-            L("语音键松开")
+            // 松键不立即关闭音频流：BLE 上可能还有 1-2 个尾音包在路上（CTL 的松开信号
+            // 0x00 往往比最后一个 RX 音频包早到几百毫秒）。立即关 streaming 会导致句尾
+            // 一两个字被丢弃（"最后两个字被吃"的根因）。延迟 300ms 再关，让尾音包都收进来。
+            // micStreaming 保持 true，让 ring 继续接收尾音；streaming 保持 true 让 didValue 继续解码。
+            L("语音键松开 · 等待尾音包（300ms）…")
+            let sessionPackets = voicePacketCount
+            let sessionBytes = voiceBytesReceived
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self else { return }
+                // 300ms 内若又按下语音键（连续操作），不关闭
+                guard !self.voiceHidDown else { return }
+                let extraPackets = self.voicePacketCount - sessionPackets
+                let extraBytes = self.voiceBytesReceived - sessionBytes
+                streaming = false; micStreaming = false
+                let dur = ProcessInfo.processInfo.systemUptime - voiceSessionStartAt
+                let expBytes = Int(dur * 8000)
+                let ratio = expBytes > 0 ? Double(voiceBytesReceived) / Double(expBytes) : 0
+                let lossPct = max(0, 1.0 - ratio) * 100
+                if extraPackets > 0 {
+                    L("语音键松开 · 时长 \(String(format:"%.1f", dur))s · 收到 \(voicePacketCount) 帧 / \(voiceBytesReceived) bytes（含尾音 +\(extraPackets)帧/\(extraBytes)b）· 丢失 \(String(format:"%.0f", min(100,lossPct)))%")
+                } else {
+                    L("语音键松开 · 时长 \(String(format:"%.1f", dur))s · 收到 \(voicePacketCount) 帧 / \(voiceBytesReceived) bytes · 预期 ~\(expBytes) bytes · 丢失 \(String(format:"%.0f", min(100,lossPct)))%")
+                }
+            }
         }
     }
 
@@ -1168,14 +1256,30 @@ final class Engine: ObservableObject {
     /// Normalize either form before dispatching a button action.
     private func handleHIDReport(_ bytes: [UInt8]) {
         let known = Set(config.buttons.map { UInt8(truncatingIfNeeded: $0.usage) } + [HIDMap.voiceUsage])
+        // 先尝试解析已知 usage——即使报告来自鼠标/指针通道，若内含已知按键也优先识别。
         if let usage = XiaomiRemoteHIDParser.usage(in: bytes, known: known) {
             hidReport(usage: usage)
-        } else if XiaomiRemoteHIDParser.isRelease(bytes) {
-            hidReport(usage: 0)
-        } else {
-            // 解析失败：打印完整 hex + 每个非零双字节，便于把新出现的 usage 补进 Config.known
-            L("未识别的 HID 报告: \(XiaomiRemoteHIDParser.describe(bytes))")
+            return
         }
+        if XiaomiRemoteHIDParser.isRelease(bytes) {
+            hidReport(usage: 0)
+            return
+        }
+        // Pro 圆盘（类 AirPods 滚轮）转动会发 ReportID=0x03 的 7 字节报告，含鼠标位移 + 滚轮。
+        // 这些事件会让 macOS 页面持续滚动（"锁到滚动"现象），且方向识别尚未搞定，
+        // 先彻底静默丢弃，不转发给系统。待后续采样确定顺/逆时针规律后再转成方向键/滚轮。
+        if bytes.count == 7 && bytes[0] == 0x03 {
+            return
+        }
+        // Pro 圆环转动会发密集的键盘数组报告（ReportID=0x01，10 字节，主键 [3] 是字母/数字
+        // usage 如 0x04(A)/0x2C(空格)/0x1D(Z) 等 + 各种修饰键组合）。这些不是按压键
+        // （按压键走 0x28/0xF1/0x4A/0x65 等，已在上面识别），是圆环触摸滑动产生的噪声，
+        // 静默丢弃，不打印日志。圆环的方向识别留待后续采样工具实现。
+        if bytes.count == 10 && bytes[0] == 0x01 {
+            return
+        }
+        // 真正未知的报告才打印，便于把新 usage 补进 Config.known
+        L("未识别的 HID 报告: \(XiaomiRemoteHIDParser.describe(bytes))")
     }
 
     private func hidReport(usage: UInt8) {
@@ -1183,6 +1287,7 @@ final class Engine: ObservableObject {
         if usage == 0x00 {
             longPressTimer?.invalidate(); longPressTimer = nil
             deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
+            recentUsages.removeAll()   // release 时清抖动记录，允许下一轮真实按压
             if voiceHidDown { voiceHidDown = false; lastHidKeycodeAt[HIDMap.voiceKeycode] = now }
             if let t = downTarget {
                 if t.usage == 0xF1 && t.keycode == 0x33 {
@@ -1204,6 +1309,26 @@ final class Engine: ObservableObject {
         // HID keeps emitting the same key-down report while a key is held.  Synthesize
         // one key-down only; the all-zero report below is responsible for key-up.
         if downButtonUsage == Int(usage) { return }
+        // 抖动检测：拿起遥控器/手指碰圆环时，圆环噪声会产生密集多变字母 usage。
+        // 但只统计"未知 usage"（不在映射表里的），已知按压键（0x28/0xF1/0x4A/0x65/0x66）
+        // 永远不参与抖动判定——这样即使按 Back 时夹杂圆环噪声，Back 也能正常触发。
+        let isKnownButton = config.buttons.contains { $0.usage == Int(usage) }
+        if !isKnownButton {
+            recentUsages = recentUsages.filter { now - $0.at < 0.2 }
+            recentUsages.append((Int(usage), now))
+            let distinctUnknown = Set(recentUsages.map { $0.usage }).count
+            if distinctUnknown >= 3 {
+                bounceSuppressUntil = now + 0.2
+                recentUsages.removeAll()
+                return   // 圆环噪声，静默忽略（不打日志，避免刷屏）
+            }
+        } else {
+            recentUsages.removeAll()   // 收到真实按键，清抖动计数
+        }
+        // 处于抖动抑制期内，仅忽略未知 usage 的 down；已知按压键始终放行
+        if now < bounceSuppressUntil && !isKnownButton {
+            return
+        }
         lastButtonUsage = Int(usage)
         lastButton = String(format: "0x%02x", usage)
         if let kc = HIDMap.usageToKeycode[usage] { lastHidKeycodeAt[kc] = now }
@@ -1262,20 +1387,26 @@ final class Engine: ObservableObject {
         deleteRepeatTimer?.invalidate()
         deleteRepeatStartedAt = ProcessInfo.processInfo.systemUptime
         lastDeleteRepeatAt = deleteRepeatStartedAt
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+        // macOS 原生长按删除手感：慢起步 → 平滑指数加速 → 高速收尾。
+        // "越闪越快"的视觉节奏来自间隔本身的非线性收缩（每次删除后间隔乘以衰减系数），
+        // 而不是按固定时间线性变化。这比线性加速更符合人眼对节奏变化的感知。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self = self, self.downButtonUsage == 0xF1 else { return }
+            // 动态间隔：用可变状态而非闭包常量，每删一次就收缩一次
+            var interval: Float = 0.12        // 起始 0.12s（~8 次/秒，慢，能看清一个个删）
+            let minInterval: Float = 0.022    // 收尾 0.022s（~45 次/秒，飞快）
+            let decay: Float = 0.92           // 每删一次间隔 ×0.92（指数加速）
             self.lastDeleteRepeatAt = ProcessInfo.processInfo.systemUptime
-            self.deleteRepeatTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
+            self.deleteRepeatTimer = Timer.scheduledTimer(withTimeInterval: 0.005, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     guard let self = self, self.downButtonUsage == 0xF1 else { return }
                     let now = ProcessInfo.processInfo.systemUptime
-                    let held = now - self.deleteRepeatStartedAt
-                    // 8 deletes/sec → 25 deletes/sec over roughly two seconds.
-                    let interval = max(0.04, 0.125 - min(0.085, max(0, held - 0.45) * 0.045))
-                    guard now - self.lastDeleteRepeatAt >= interval else { return }
+                    guard now - self.lastDeleteRepeatAt >= TimeInterval(interval) else { return }
                     self.lastDeleteRepeatAt = now
                     self.postKey(0x33, down: true, cmd: false)
                     self.postKey(0x33, down: false, cmd: false)
+                    // 每删一次，间隔指数收缩一次 → 越闪越快
+                    interval = max(minInterval, interval * decay)
                 }
             }
         }
@@ -1325,16 +1456,16 @@ final class Engine: ObservableObject {
     // called from tap thread — keep it cheap & thread-safe-ish (dictionary read)
     nonisolated func shouldSuppress(_ kc: CGKeyCode) -> Bool {
         // suppress if the remote produced this keycode within the last 120ms AND that button is mapped to something other than "keep original"
+        // 注意：此函数从 CGEvent tap 线程高频调用，绝不能在里面打日志或做重活，
+        // 否则会拖慢整个事件流（曾因每次都 L() 导致主线程繁忙、语音卡顿、Back 删除时序错乱）。
         var suppress = false
         MainActor.assumeIsolated {
             let now = ProcessInfo.processInfo.systemUptime
-            // With the device-level mapping active, F5 has become the genuine
-            // Apple Globe/Fn HID event and must reach the input method.  Until
-            // the mapping becomes available, keep swallowing F5 so it cannot
-            // trigger macOS's native dictation shortcut.
+            // 设备层映射生效后（hardwareGlobeReady==true），F5 已被重映射成 Globe/LeftControl，
+            // 这时放行是【正常】的，绝不能报警告。仅在"映射未就绪且 F5 漏过来"时才吞掉，
+            // 防止触发 macOS 原生听写。
             if kc == HIDMap.voiceKeycode {
                 suppress = !hardwareGlobeReady && (voiceHidDown || (lastHidKeycodeAt[kc].map { now - $0 < 0.12 } ?? false))
-                if !suppress { L("⚠️ F5 事件到达时语音键标记未立，漏过一次（请反馈）") }
                 return
             }
             if let ts = lastHidKeycodeAt[kc], now - ts < 0.12 {
@@ -1384,6 +1515,41 @@ final class Engine: ObservableObject {
             postKey(0x67, down: true, cmd: false, shift: false, opt: false, ctrl: false)
             postKey(0x67, down: false, cmd: false)
             L("→ 已发送显示桌面（F11）")
+        case KeyNames.kOpenNotes:
+            // 打开 macOS 备忘录，并自动新建一条笔记。用 NSWorkspace 按 bundle id 打开，
+            // App 真正激活后再发 ⌘N 新建笔记（在 completion 里触发，避免 App 还没起来就发键）。
+            let ws = NSWorkspace.shared
+            let openAndFocus = {
+                // 等 Notes 完全成为前台后再发 ⌘N。延迟 0.4s 足够它绘制窗口。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                    guard let self else { return }
+                    // ⌘N = 新建笔记（Notes 的标准快捷键）
+                    self.postKey(0x2D, down: true, cmd: true)   // 0x2D = N
+                    self.postKey(0x2D, down: false, cmd: false)
+                }
+            }
+            if let appURL = ws.urlForApplication(withBundleIdentifier: "com.apple.Notes") {
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true   // 确保成为前台
+                ws.openApplication(at: appURL, configuration: config) { _, error in
+                    if let error {
+                        Task { @MainActor in self.L("⚠️ 打开备忘录失败：\(error.localizedDescription)") }
+                    } else {
+                        Task { @MainActor in
+                            self.L("→ 已打开备忘录，正在新建笔记…")
+                            openAndFocus()
+                        }
+                    }
+                }
+            } else {
+                // 兜底：用 open 命令打开，再延迟发 ⌘N
+                let task = Process()
+                task.launchPath = "/usr/bin/open"
+                task.arguments = ["-a", "Notes"]
+                try? task.run()
+                L("→ 已打开备忘录（fallback），正在新建笔记…")
+                openAndFocus()
+            }
         case KeyNames.kScreenshotAndLock:
             // Save a full-screen screenshot first; lock shortly afterwards so the
             // screenshot reflects the current coding context rather than the lock UI.
