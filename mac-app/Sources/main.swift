@@ -10,10 +10,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.start()
 
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 860, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
-        w.title = "小米 Vibecoding 键盘"
+        w.title = "MiVibeBoard"
         w.contentView = NSHostingView(rootView: ContentView(e: engine))
         w.center()
         w.isReleasedWhenClosed = false
