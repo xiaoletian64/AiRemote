@@ -187,7 +187,7 @@ struct ContentView: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("按键控制") .font(.title2.bold())
-                    Text("语音键固定为原生 Fn；其他键可录制 Mac 快捷键或选择系统动作。")
+                    Text("兼容小米 BLE 遥控器的两种 HID 报告格式。语音键固定为原生 Fn；其他键可录制 Mac 快捷键或选择系统动作。")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()

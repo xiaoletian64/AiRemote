@@ -53,13 +53,43 @@ enum KeyNames {
 }
 
 enum HIDMap {
-    // remote HID usage (report byte3) -> macOS keycode macOS also generates (for suppression)
+    // Remote HID usage -> macOS keycode macOS also generates (for suppression).
+    // Some models emit a keyboard-array report, while others emit a compact
+    // byte report; Engine normalizes both forms before consulting this table.
     static let usageToKeycode: [UInt8: CGKeyCode] = [
-        0x52:0x7E, 0x51:0x7D, 0x50:0x7B, 0x4F:0x7C, 0x28:0x24, 0x4A:0x73, 0x35:0x32,
+        0x52:0x7E, 0x51:0x7D, 0x50:0x7B, 0x4F:0x7C,
+        0x28:0x24, 0x4A:0x73, 0x35:0x32, 0x65:0x6E,
     ]
     // 语音键除 BLE 语音流外还会发一个 HID F5（usage 0x3E）；macOS 把 F5 当系统听写🎤键，必须吞掉
     static let voiceUsage: UInt8 = 0x3E
     static let voiceKeycode: CGKeyCode = 0x60   // F5
+}
+
+enum XiaomiRemoteHIDParser {
+    /// Xiaomi remotes in the wild expose both a compact usage byte and a
+    /// report-ID-prefixed array of little-endian UInt16 usages.  Prefer a
+    /// complete UInt16 match so a report header cannot be mistaken for a key.
+    static func usage(in bytes: [UInt8], known: Set<UInt8>) -> UInt8? {
+        guard !bytes.isEmpty else { return nil }
+        var matches: [UInt8] = []
+        for offset in 0...min(1, max(0, bytes.count - 2)) {
+            var index = offset
+            while index + 1 < bytes.count {
+                let value = UInt16(bytes[index]) | UInt16(bytes[index + 1]) << 8
+                if value <= UInt16(UInt8.max), let usage = UInt8(exactly: value), known.contains(usage), usage != 0 {
+                    matches.append(usage)
+                }
+                index += 2
+            }
+        }
+        if let usage = matches.last { return usage }
+        // Older remotes use a single usage byte in a vendor report.
+        return bytes.reversed().first { known.contains($0) && $0 != 0 }
+    }
+
+    static func isRelease(_ bytes: [UInt8]) -> Bool {
+        bytes.allSatisfy { $0 == 0 } || (bytes.count > 1 && bytes.dropFirst().allSatisfy { $0 == 0 })
+    }
 }
 
 struct ButtonMapping: Identifiable, Codable {
