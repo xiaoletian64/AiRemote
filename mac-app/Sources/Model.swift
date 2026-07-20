@@ -133,7 +133,7 @@ struct Config: Codable {
         0x4F:(0x7C,false,false,false,false),  // →
         0x28:(0x24,false,false,false,false),  // OK → Enter
         0xF1:(0x33,false,false,false,false),  // Back → Delete（按住连续删除）
-        0x4A:(KeyNames.kShowDesktop,false,false,false,false), // Home → 显示桌面（主页）
+        0x4A:(0x09,true,false,false,false),   // Home → ⌘V，粘贴刚完成的语音转写
         0x65:(0x35,false,false,false,false),  // Menu → Esc
         0x66:(KeyNames.kLockScreen,false,false,false,false), // Power → 仅锁屏
         // 0x35 TV 键、0x66 电源、0x80/0x81 音量 ± 保持原键（不拦截）
@@ -177,36 +177,33 @@ final class ConfigStore {
         // mapped at the HID layer to macOS's real Apple Globe/Fn usage so WeChat
         // IME receives a hardware-style Fn hold rather than a synthetic key event.
         cfg.voice = ButtonMapping(usage: -1, name: "语音键", keycode: 0x3F, cmd: false)
-        // Upgrade the original Menu → Esc default with a hold-to-interrupt action.
-        // Do not overwrite a user-selected long-press action.
+        // Upgrade original defaults created before the Mac-only control scheme.
+        // This runs once per install so later user changes in the mapping UI stay intact.
+        let defaultsVersionKey = "mappingDefaultsVersion"
+        if UserDefaults.standard.integer(forKey: defaultsVersionKey) < 3 {
+            func installDefault(_ usage: Int, keycode: Int, cmd: Bool = false, longPress: Int? = nil) {
+                guard let i = cfg.buttons.firstIndex(where: { $0.usage == usage }) else { return }
+                cfg.buttons[i].keycode = keycode
+                cfg.buttons[i].cmd = cmd
+                cfg.buttons[i].shift = false
+                cfg.buttons[i].opt = false
+                cfg.buttons[i].ctrl = false
+                cfg.buttons[i].longPressKeycode = longPress
+            }
+            installDefault(0xF1, keycode: 0x33)                         // Back → Delete
+            installDefault(0x4A, keycode: 0x09, cmd: true)              // Home → ⌘V
+            installDefault(0x65, keycode: 0x35, longPress: KeyNames.kInterrupt) // Menu → Esc / ⌃C
+            installDefault(0x66, keycode: KeyNames.kLockScreen, longPress: KeyNames.kShutdownConfirm)
+            UserDefaults.standard.set(3, forKey: defaultsVersionKey)
+            save(cfg)
+        }
+        // Keep the original Menu → Esc default usable for configurations saved
+        // before long-press support was introduced.
         if let menu = cfg.buttons.firstIndex(where: { $0.usage == 0x65 }),
            cfg.buttons[menu].keycode == 0x35,
            cfg.buttons[menu].longPressKeycode == nil {
             cfg.buttons[menu].longPressKeycode = KeyNames.kInterrupt
         }
-        // Migrate only the former factory defaults; a user's custom Home or
-        // Power mapping is never overwritten.
-        var migrated = false
-        if let home = cfg.buttons.firstIndex(where: { $0.usage == 0x4A }),
-           cfg.buttons[home].keycode == 0x23,
-           cfg.buttons[home].cmd,
-           !cfg.buttons[home].shift,
-           !cfg.buttons[home].opt,
-           !cfg.buttons[home].ctrl {
-            cfg.buttons[home].keycode = KeyNames.kShowDesktop
-            cfg.buttons[home].cmd = false
-            migrated = true
-        }
-        if let power = cfg.buttons.firstIndex(where: { $0.usage == 0x66 }),
-           cfg.buttons[power].keycode == KeyNames.kScreenshotAndLock,
-           !cfg.buttons[power].cmd,
-           !cfg.buttons[power].shift,
-           !cfg.buttons[power].opt,
-           !cfg.buttons[power].ctrl {
-            cfg.buttons[power].keycode = KeyNames.kLockScreen
-            migrated = true
-        }
-        if migrated { save(cfg) }
         return cfg
     }
     static func save(_ cfg: Config) {
