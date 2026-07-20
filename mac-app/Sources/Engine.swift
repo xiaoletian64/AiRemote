@@ -1052,6 +1052,12 @@ final class Engine: ObservableObject {
         case KeyNames.kMouseRClick: postMouse(.rightMouseDown, .right)
         case KeyNames.kLockScreen:
             lockScreen()
+        case KeyNames.kShowDesktop:
+            // F11 is macOS's standard Show Desktop shortcut. It keeps the
+            // remote's Home button system-level and independent of any editor.
+            postKey(0x67, down: true, cmd: false, shift: false, opt: false, ctrl: false)
+            postKey(0x67, down: false, cmd: false)
+            L("→ 已发送显示桌面（F11）")
         case KeyNames.kScreenshotAndLock:
             // Save a full-screen screenshot first; lock shortly afterwards so the
             // screenshot reflects the current coding context rather than the lock UI.
