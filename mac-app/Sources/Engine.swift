@@ -246,6 +246,10 @@ final class Engine: ObservableObject {
     private var lastHidKeycodeAt: [CGKeyCode: TimeInterval] = [:]
     private var voiceHidDown = false   // 语音键的 HID F5 正被按住（需持续吞掉）
     private var downButtonUsage: Int = 0
+    // 圆盘协议学习模式：UI 开启后，记录原始 03 报告 + 时间戳，供分析顺/逆时针编码规律。
+    @Published var ringLearningMode = false
+    private var ringLearningBuffer: [(bytes: [UInt8], at: TimeInterval)] = []
+    private var ringLearnStartAt: TimeInterval = 0
     // 抖动检测：拿起遥控器/手指碰圆环时会产生密集且多变的 usage 切换（0xF1/0x28/0x51 混跳），
     // 真实按键是单一 usage 持续保持。记录近期（200ms 内）出现的不同 usage 集合，
     // 若短时间内切换 ≥3 种不同 usage，判定为抖动，忽略这批脉冲，避免误删除。
@@ -452,6 +456,47 @@ final class Engine: ObservableObject {
         applyVoiceGlobeMapping()
         saveConfig()
         L("语音键模式已切换为 \(mode.label)")
+    }
+
+    // ---------- 圆盘协议学习模式 ----------
+    /// 开启学习：清缓冲区，开始记录原始 03 报告。UI 引导用户在圆盘各位置转动采样。
+    func startRingLearning() {
+        ringLearningMode = true
+        ringLearningBuffer.removeAll()
+        ringLearnStartAt = ProcessInfo.processInfo.systemUptime
+        L("🗃 圆盘学习模式已开启，请在圆盘各位置转动采样（顺时针/逆时针各几圈）")
+    }
+    /// 结束学习：停止记录，分析规律并固化。当前先打印统计，后续实现自动生成判定规则。
+    func stopRingLearning() {
+        ringLearningMode = false
+        L("🗃 圆盘学习结束，共记录 \(ringLearningBuffer.count) 个报告")
+        analyzeRingLearning()
+    }
+    /// 分析学习缓冲区，找出顺/逆时针的编码特征。当前输出统计供确认规律。
+    private func analyzeRingLearning() {
+        guard !ringLearningBuffer.isEmpty else { return }
+        var xSum = 0, ySum = 0, wheelSum = 0
+        var xNeg = 0, yNeg = 0, wheelNeg = 0
+        for r in ringLearningBuffer {
+            let x = Int16(UInt16(r.bytes[2]) | UInt16(r.bytes[3]) << 8)
+            let y = Int16(UInt16(r.bytes[4]) | UInt16(r.bytes[5]) << 8)
+            let w = Int8(bitPattern: r.bytes[6])
+            xSum += Int(x); if x < 0 { xNeg += 1 }
+            ySum += Int(y); if y < 0 { yNeg += 1 }
+            wheelSum += Int(w); if w < 0 { wheelNeg += 1 }
+        }
+        let n = ringLearningBuffer.count
+        L("📊 学习分析（\(n) 报告）: X均值=\(Double(xSum)/Double(n)) 负值占比=\(Double(xNeg)/Double(n)) | Y均值=\(Double(ySum)/Double(n)) 负值=\(Double(yNeg)/Double(n)) | wheel均值=\(Double(wheelSum)/Double(n)) 负值=\(Double(wheelNeg)/Double(n))")
+        // 关键判断：如果某分量有明显正负区分，说明该分量编码方向
+        if Double(wheelNeg)/Double(n) > 0.3 || Double(wheelNeg)/Double(n) < 0.1 && wheelSum != 0 {
+            L("→ wheel 分量疑似编码方向（正值多/负值多）")
+        }
+        if Double(xNeg)/Double(n) > 0.3 || (Double(xNeg)/Double(n) < 0.1 && xSum != 0) {
+            L("→ X 分量疑似编码方向")
+        }
+        if Double(yNeg)/Double(n) > 0.3 || (Double(yNeg)/Double(n) < 0.1 && ySum != 0) {
+            L("→ Y 分量疑似编码方向")
+        }
     }
 
     // ---------- keyboard capture (record a target key) ----------
@@ -1265,10 +1310,18 @@ final class Engine: ObservableObject {
             hidReport(usage: 0)
             return
         }
-        // Pro 圆盘（类 AirPods 滚轮）转动会发 ReportID=0x03 的 7 字节报告，含鼠标位移 + 滚轮。
-        // 这些事件会让 macOS 页面持续滚动（"锁到滚动"现象），且方向识别尚未搞定，
-        // 先彻底静默丢弃，不转发给系统。待后续采样确定顺/逆时针规律后再转成方向键/滚轮。
+        // Pro 圆盘（类 AirPods 滚轮）转动会发 ReportID=0x03 的 7 字节报告。
+        // 诊断期：始终打印 03 报告（不依赖学习模式），确认圆盘报告是否到达 App。
+        // 协议学习模式开启时，额外记录到缓冲区供分析。
         if bytes.count == 7 && bytes[0] == 0x03 {
+            let x = Int16(UInt16(bytes[2]) | UInt16(bytes[3]) << 8)
+            let y = Int16(UInt16(bytes[4]) | UInt16(bytes[5]) << 8)
+            let w = Int8(bitPattern: bytes[6])
+            L("🖲圆盘: \(bytes.map{String(format:"%02X",$0)}.joined(separator:" ")) | X=\(x) Y=\(y) w=\(w)")
+            if ringLearningMode {
+                let now = ProcessInfo.processInfo.systemUptime
+                ringLearningBuffer.append((bytes: bytes, at: now))
+            }
             return
         }
         // Pro 圆环转动会发密集的键盘数组报告（ReportID=0x01，10 字节，主键 [3] 是字母/数字
@@ -1309,24 +1362,21 @@ final class Engine: ObservableObject {
         // HID keeps emitting the same key-down report while a key is held.  Synthesize
         // one key-down only; the all-zero report below is responsible for key-up.
         if downButtonUsage == Int(usage) { return }
-        // 抖动检测：拿起遥控器/手指碰圆环时，圆环噪声会产生密集多变字母 usage。
-        // 但只统计"未知 usage"（不在映射表里的），已知按压键（0x28/0xF1/0x4A/0x65/0x66）
-        // 永远不参与抖动判定——这样即使按 Back 时夹杂圆环噪声，Back 也能正常触发。
-        let isKnownButton = config.buttons.contains { $0.usage == Int(usage) }
-        if !isKnownButton {
-            recentUsages = recentUsages.filter { now - $0.at < 0.2 }
-            recentUsages.append((Int(usage), now))
-            let distinctUnknown = Set(recentUsages.map { $0.usage }).count
-            if distinctUnknown >= 3 {
-                bounceSuppressUntil = now + 0.2
-                recentUsages.removeAll()
-                return   // 圆环噪声，静默忽略（不打日志，避免刷屏）
-            }
-        } else {
-            recentUsages.removeAll()   // 收到真实按键，清抖动计数
+        // 抖动检测：拿起遥控器/手指抖动会产生短时间多键快速来回跳的脉冲序列。
+        // Back 已改为"仅长按删除"（按住 0.4s 才删），拿起抖动脉冲天然被过滤，
+        // 所以这里的抖动检测主要针对其他按键的误触发，用宽松条件避免误杀真实操作：
+        // 150ms 内出现 ≥4 种不同按键才判抖动（真实操作极少在 150ms 内连按 4 种键）。
+        recentUsages = recentUsages.filter { now - $0.at < 0.15 }
+        recentUsages.append((Int(usage), now))
+        let distinctCount = Set(recentUsages.map { $0.usage }).count
+        if distinctCount >= 4 {
+            bounceSuppressUntil = now + 0.15
+            recentUsages.removeAll()
+            L("⚠️ 检测到抖动（150ms 内 \(distinctCount) 种按键切换），忽略此批脉冲")
+            return
         }
-        // 处于抖动抑制期内，仅忽略未知 usage 的 down；已知按压键始终放行
-        if now < bounceSuppressUntil && !isKnownButton {
+        // 处于抖动抑制期内，忽略新的 down（release 不忽略，确保能复位）
+        if now < bounceSuppressUntil {
             return
         }
         lastButtonUsage = Int(usage)
@@ -1343,11 +1393,10 @@ final class Engine: ObservableObject {
         self.flashKey(label: m.name, mapping: m.display)
         if m.keycode == KeyNames.kNone { downButtonUsage = Int(usage); downTarget = nil; return }
         if Int(usage) == 0xF1 && m.keycode == 0x33 {
-            // One short press means exactly one deletion. Holding begins a
-            // separately controlled repeat curve after a short grace period.
-            postKey(0x33, down: true, cmd: false)
-            postKey(0x33, down: false, cmd: false)
+            // Back 改为「仅长按删除」：单击不删除（避免拿起遥控器/手指抖动误触），
+            // 按住 ≥400ms 才开始连续删除。拿起的短脉冲不会持续 400ms，天然被过滤。
             downButtonUsage = Int(usage); downTarget = m
+            L("Back 已按下，按住 0.4 秒后开始删除…")
             startDeleteRepeat()
             return
         }
@@ -1390,7 +1439,9 @@ final class Engine: ObservableObject {
         // macOS 原生长按删除手感：慢起步 → 平滑指数加速 → 高速收尾。
         // "越闪越快"的视觉节奏来自间隔本身的非线性收缩（每次删除后间隔乘以衰减系数），
         // 而不是按固定时间线性变化。这比线性加速更符合人眼对节奏变化的感知。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+        // 首延迟 0.4s：配合"仅长按删除"——拿起抖动脉冲通常 <300ms，400ms 足以过滤；
+        // 真实长按 0.4s 后才开始删，响应仍够快。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self = self, self.downButtonUsage == 0xF1 else { return }
             // 动态间隔：用可变状态而非闭包常量，每删一次就收缩一次
             var interval: Float = 0.12        // 起始 0.12s（~8 次/秒，慢，能看清一个个删）
