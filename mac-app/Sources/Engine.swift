@@ -1273,7 +1273,10 @@ final class Engine: ObservableObject {
                 guard let context = context, len > 0 else { return }
                 let me = Unmanaged<Engine>.fromOpaque(context).takeUnretainedValue()
                 let bytes = Array(UnsafeBufferPointer(start: report, count: Int(len)))
-                MainActor.assumeIsolated { me.handleHIDReport(bytes) }
+                // HID 回调可能在不同时机/线程触发，用 Task @MainActor 异步派发到主线程，
+                // 避免 MainActor.assumeIsolated 在 runloop 未就绪时 trap 崩溃
+                // （从 /Applications 启动时曾因此崩溃 EXC_BREAKPOINT）。
+                Task { @MainActor in me.handleHIDReport(bytes) }
             }, ctx)
             IOHIDDeviceScheduleWithRunLoop(dvc, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
         }
@@ -1310,18 +1313,11 @@ final class Engine: ObservableObject {
             hidReport(usage: 0)
             return
         }
-        // Pro 圆盘（类 AirPods 滚轮）转动会发 ReportID=0x03 的 7 字节报告。
-        // 诊断期：始终打印 03 报告（不依赖学习模式），确认圆盘报告是否到达 App。
-        // 协议学习模式开启时，额外记录到缓冲区供分析。
+        // Pro 圆盘（类 AirPods 滚轮）转动会发 ReportID=0x03 的 7 字节报告，含鼠标位移 + 滚轮。
+        // 调研结论：从 /Applications 启动时报告能收到，但 macOS 事件系统行为不稳定
+        // （build 目录启动被系统拦截），且方向编码全是正值无负值、规律未明。
+        // 保持静默，不转发（避免页面"锁到滚动"），不刷屏日志。
         if bytes.count == 7 && bytes[0] == 0x03 {
-            let x = Int16(UInt16(bytes[2]) | UInt16(bytes[3]) << 8)
-            let y = Int16(UInt16(bytes[4]) | UInt16(bytes[5]) << 8)
-            let w = Int8(bitPattern: bytes[6])
-            L("🖲圆盘: \(bytes.map{String(format:"%02X",$0)}.joined(separator:" ")) | X=\(x) Y=\(y) w=\(w)")
-            if ringLearningMode {
-                let now = ProcessInfo.processInfo.systemUptime
-                ringLearningBuffer.append((bytes: bytes, at: now))
-            }
             return
         }
         // Pro 圆环转动会发密集的键盘数组报告（ReportID=0x01，10 字节，主键 [3] 是字母/数字
