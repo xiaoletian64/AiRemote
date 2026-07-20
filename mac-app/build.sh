@@ -112,21 +112,19 @@ if [ "$DO_DMG" = "1" ]; then
     ln -s /Applications "$STAGING/Applications"
     # 简易 README
     cat > "$STAGING/README-安装说明.txt" <<'EOF'
-小米 Vibecoding 键盘 - 安装说明
-================================
+小米语音遥控器 - 安装说明
+========================
 
-1. 把 MiVibeBoard 拖到右侧的 Applications 文件夹
-2. 进入「应用程序」，按住 Control 键单击 MiVibeBoard，选择「打开」
-3. 系统可能会拦：点「仍要打开」（因为是社区签名 App）
-4. 首次启动时按 App 提示授权：
+1. 把「小米语音遥控器」拖到右侧的 Applications 文件夹
+2. 进入「应用程序」并打开它；首次启动时按系统提示允许权限
+3. 首次启动时按 App 提示授权：
    - 辅助功能 (Accessibility)
    - 输入监控 (Input Monitoring)
-5. 如要使用「按住语音键 → 系统麦克风输入」：
-   - 安装 BlackHole 2ch: brew install blackhole-2ch
-   - 重启电脑
-   - 系统设置 → 声音 → 输入 → 选 BlackHole 2ch
-6. 长按遥控器【主页】+【菜单】5 秒进入配对模式，App 自动连接
-7. 按遥控器按键 / 长按语音键开始用
+4. 如要使用「按住语音键 → 系统麦克风输入」：
+   - 安装 BlackHole 2ch: brew install --cask blackhole-2ch
+   - App 会自动选择 BlackHole 2ch 为系统输入；无需重启 Mac
+5. 长按遥控器【主页】+【菜单】5 秒进入配对模式，App 自动连接
+6. 按遥控器按键 / 长按语音键开始用
 
 卸载：直接拖到废纸篓即可。
 
