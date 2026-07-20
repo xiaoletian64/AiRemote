@@ -166,6 +166,10 @@ final class Engine: ObservableObject {
     private var capsSent = false
     private var streaming = false
     private var lastVoicePacketAt: TimeInterval = 0
+    private var systemSuspended = false
+    private var reconnectGeneration = 0
+    private var lastRecoveryAt: TimeInterval = 0
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     // HID
     private var hidMgr: IOHIDManager?
@@ -225,6 +229,7 @@ final class Engine: ObservableObject {
 
         // BLE 初始化
         cm = CBCentralManager(delegate: proxy, queue: nil)
+        installSessionObservers()
 
         // HID 和音频等权限到位后再做，定时器会重试
         Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
@@ -255,8 +260,74 @@ final class Engine: ObservableObject {
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
         voiceGlobeMapper.restore()
+        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        workspaceObservers.removeAll()
         hardwareGlobeReady = false
         L("已恢复遥控器原始语音键映射")
+    }
+
+    /// A locked Mac can leave CoreBluetooth and CoreAudio objects alive while their
+    /// underlying transport is no longer usable. Treat both a real display wake and
+    /// an unlocked user session as a fresh connection generation.
+    private func installSessionObservers() {
+        guard workspaceObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.prepareForSleep() }
+        })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.recoverAfterSessionChange(reason: "屏幕唤醒") }
+        })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.recoverAfterSessionChange(reason: "解锁后恢复") }
+        })
+    }
+
+    private func prepareForSleep() {
+        guard !systemSuspended else { return }
+        systemSuspended = true
+        reconnectGeneration &+= 1
+        cm?.stopScan(); scanning = false
+        streaming = false; micStreaming = false; voiceHidDown = false
+        longPressTimer?.invalidate(); longPressTimer = nil
+        deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
+        engine.pause()
+        L("🌙 系统睡眠：已暂停语音与重连任务")
+    }
+
+    private func recoverAfterSessionChange(reason: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        // macOS may emit both screen-wake and session-active for one unlock.
+        guard now - lastRecoveryAt > 1.0 else { return }
+        lastRecoveryAt = now
+        systemSuspended = false
+        reconnectGeneration &+= 1
+        let generation = reconnectGeneration
+        L("☀️ \(reason)：正在恢复遥控器、音频与 Fn 映射")
+
+        cm?.stopScan(); scanning = false
+        streaming = false; micStreaming = false; voiceHidDown = false
+        remoteConnected = false; handshakeReady = false; capsSent = false; tx = nil
+        if let dev { cm?.cancelPeripheralConnection(dev) }
+        teardownHID()
+        checkBlackHole()
+        if blackholeFound && !blackholeSelectedAsInput { selectBlackHoleAsSystemInput() }
+        applyVoiceGlobeMapping()
+
+        // Bluetooth and CoreAudio are commonly still settling during the first
+        // second after unlock; reconnect only after that window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.reconnectGeneration == generation, !self.systemSuspended else { return }
+            self.audioWatchdog(reason: "\(reason) 后恢复")
+            self.setupHID()
+            self.startSearching()
+        }
     }
 
     private func applyVoiceGlobeMapping() {
@@ -526,7 +597,8 @@ final class Engine: ObservableObject {
         }
     }
     func startSearching() {
-        guard let c = cm, c.state == .poweredOn else { return }
+        guard !systemSuspended, let c = cm, c.state == .poweredOn else { return }
+        let generation = reconnectGeneration
         // 1) 优先看是否已在系统蓝牙里配对过（按多个服务 UUID 逐个 try）
         //    小米遥控器配对后会与系统持有 HID(0x1812)/Battery(0x180F) 持续连接
         for svc in seed {
@@ -545,19 +617,27 @@ final class Engine: ObservableObject {
             L("💡 提示：长按遥控器【主页+菜单】5秒，指示灯快闪即进入配对模式")
             // 30 秒内没找到就停止扫描
             DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-                guard let s = self, s.scanning else { return }
+                guard let s = self, s.scanning, !s.systemSuspended,
+                      s.reconnectGeneration == generation else { return }
                 s.cm?.stopScan(); s.scanning = false
                 s.L("⚠️ 30 秒内未发现遥控器，将在 3 秒后重试。")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.startSearching() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    guard let self, self.reconnectGeneration == generation, !self.systemSuspended else { return }
+                    self.startSearching()
+                }
             }
         }
     }
     // 防御性：连接失败也重连
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         L("⚠️ 连接失败: \(error?.localizedDescription ?? "?")，3 秒后重试。")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.startSearching() }
+        let generation = reconnectGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.reconnectGeneration == generation, !self.systemSuspended else { return }
+            self.startSearching()
+        }
     }
-    func retryScan() { startSearching() }
+    func retryScan() { recoverAfterSessionChange(reason: "手动重新连接") }
     fileprivate func didDiscover(_ p: CBPeripheral, rssi: Int) {
         // 第一个匹配的就停止扫描、连接
         cm.stopScan(); scanning = false
@@ -569,8 +649,13 @@ final class Engine: ObservableObject {
     fileprivate func didConnect(_ p: CBPeripheral) { remoteConnected = true; p.discoverServices([ATVV]) }
     fileprivate func didDisconnect() {
         remoteConnected = false; handshakeReady = false; streaming = false
+        guard !systemSuspended else { return }
         // 自动重连：先看是否系统配对，再扫描
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startSearching() }
+        let generation = reconnectGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, self.reconnectGeneration == generation, !self.systemSuspended else { return }
+            self.startSearching()
+        }
     }
     fileprivate func didServices(_ p: CBPeripheral) {
         if let s = p.services?.first(where: { $0.uuid == ATVV }) { p.discoverCharacteristics([TX,RX,CTL], for: s) }
@@ -699,6 +784,22 @@ final class Engine: ObservableObject {
         }
         hidMgr = mgr
         if hidMgr != nil { flashKey(label: "✓ 遥控器就绪", mapping: "可以开始按键") }
+    }
+
+    private func teardownHID() {
+        guard let manager = hidMgr else { return }
+        if let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> {
+            for device in devices {
+                IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+                IOHIDDeviceClose(device, IOHIDOptionsType(kIOHIDOptionsTypeNone))
+            }
+        }
+        IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDManagerClose(manager, IOHIDOptionsType(kIOHIDOptionsTypeNone))
+        hidMgr = nil
+        hidBufs.forEach { $0.deallocate() }
+        hidBufs.removeAll()
+        L("已重置遥控器 HID 监听")
     }
 
     /// Xiaomi remotes expose slightly different HID report layouts by model.  Rather
