@@ -1273,10 +1273,15 @@ final class Engine: ObservableObject {
                 guard let context = context, len > 0 else { return }
                 let me = Unmanaged<Engine>.fromOpaque(context).takeUnretainedValue()
                 let bytes = Array(UnsafeBufferPointer(start: report, count: Int(len)))
-                // HID 回调可能在不同时机/线程触发，用 Task @MainActor 异步派发到主线程，
-                // 避免 MainActor.assumeIsolated 在 runloop 未就绪时 trap 崩溃
-                // （从 /Applications 启动时曾因此崩溃 EXC_BREAKPOINT）。
-                Task { @MainActor in me.handleHIDReport(bytes) }
+                // HID 设备注册在 main runloop，回调必在 main 线程。用 assumeIsolated 同步处理，
+                // 保证抖动检测的时间窗准确（之前用 Task @MainActor 异步导致窗口打散、抖动检测失效，
+                // 拿起遥控器的脉冲没被拦住，疯狂触发删除）。
+                // assumeIsolated 在 main 线程是安全的；若极端情况不在 main，跳过本次（不崩）。
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { me.handleHIDReport(bytes) }
+                } else {
+                    DispatchQueue.main.async { Task { @MainActor in me.handleHIDReport(bytes) } }
+                }
             }, ctx)
             IOHIDDeviceScheduleWithRunLoop(dvc, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
         }
@@ -1358,22 +1363,32 @@ final class Engine: ObservableObject {
         // HID keeps emitting the same key-down report while a key is held.  Synthesize
         // one key-down only; the all-zero report below is responsible for key-up.
         if downButtonUsage == Int(usage) { return }
-        // 抖动检测：拿起遥控器/手指抖动会产生短时间多键快速来回跳的脉冲序列。
-        // Back 已改为"仅长按删除"（按住 0.4s 才删），拿起抖动脉冲天然被过滤，
-        // 所以这里的抖动检测主要针对其他按键的误触发，用宽松条件避免误杀真实操作：
-        // 150ms 内出现 ≥4 种不同按键才判抖动（真实操作极少在 150ms 内连按 4 种键）。
+        // 抖动检测：拿起遥控器/手指抖动会产生短时间多键快速来回跳的脉冲序列
+        // （如 0xf1→0x28→0x52 混跳）。真实人不可能在 150ms 内连按 3 种不同按压键。
+        // 阈值用 3（不是 4）：实测拿起抖动常是 3 种混合，4 会漏判。
         recentUsages = recentUsages.filter { now - $0.at < 0.15 }
         recentUsages.append((Int(usage), now))
         let distinctCount = Set(recentUsages.map { $0.usage }).count
-        if distinctCount >= 4 {
+        if distinctCount >= 3 {
             bounceSuppressUntil = now + 0.15
             recentUsages.removeAll()
-            L("⚠️ 检测到抖动（150ms 内 \(distinctCount) 种按键切换），忽略此批脉冲")
+            // 抖动判定时强制停掉所有按键定时器（防止 Back 的 0.4s 删除定时器已启动、继续删）
+            longPressTimer?.invalidate(); longPressTimer = nil
+            deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
+            downButtonUsage = 0; downTarget = nil
+            L("⚠️ 检测到抖动（150ms 内 \(distinctCount) 种按键切换），已停所有定时器")
             return
         }
         // 处于抖动抑制期内，忽略新的 down（release 不忽略，确保能复位）
         if now < bounceSuppressUntil {
             return
+        }
+        // 额外保护：Back 的删除定时器若在等待中（0.4s 内）收到别的按键，立即取消
+        // （真实长按 Back 不会夹杂其他按键）。
+        if downButtonUsage == 0xF1 && Int(usage) != 0xF1 {
+            deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
+            longPressTimer?.invalidate(); longPressTimer = nil
+            downButtonUsage = 0; downTarget = nil
         }
         lastButtonUsage = Int(usage)
         lastButton = String(format: "0x%02x", usage)
@@ -1691,7 +1706,11 @@ final class Engine: ObservableObject {
     }
 
     // ---------- synthesize keys ----------
-    private let evSrc = CGEventSource(stateID: .hidSystemState)
+    // 用 .privateState 而非 .hidSystemState：私有状态源不污染系统 HID 修饰键状态。
+    // 之前用 hidSystemState 时，合成带 ⌘ 的事件（如 ⌘N 打开备忘录）会改变系统对修饰键的
+    // 认知，导致物理 ⌘ 键失灵（"command 不能用"）。privateState 下合成事件自带 flags，
+    // 不读取也不修改系统状态，彻底隔离。postKey 已显式传 cmd/shift/opt/ctrl，不受影响。
+    private let evSrc = CGEventSource(stateID: .privateState)
     func postKey(_ code: CGKeyCode, down: Bool, cmd: Bool, shift: Bool = false, opt: Bool = false, ctrl: Bool = false) {
         guard AXIsProcessTrusted() else {
             if code == 0x3F && down { L("❌ Fn 未发送：需要在系统设置中允许「小米超级键盘」的辅助功能权限") }
