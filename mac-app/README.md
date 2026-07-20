@@ -19,9 +19,9 @@
 | 方向键 | 光标方向 |
 | OK | Return |
 | Back | 单击 Delete；按住后渐进加速连续删除 |
-| Home | `⌘P`（VS Code/Cursor 快速打开） |
+| Home | 显示桌面（主页） |
 | Menu | 短按 Esc；长按 `⌃C` 中断终端/AI 任务 |
-| Power 短按 | 截全屏后锁屏 |
+| Power 短按 | 仅锁屏 |
 | Power 长按 1.5 秒 | 关机确认框 |
 | 语音键 | 固定为原生 `Fn` / Globe，同时转发音频到 BlackHole |
 

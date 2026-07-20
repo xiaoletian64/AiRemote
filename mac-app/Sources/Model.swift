@@ -24,11 +24,12 @@ enum KeyNames {
     static let kMouseUp = 0x10001, kMouseDown = 0x10002, kMouseLeft = 0x10003, kMouseRight = 0x10004
     static let kMouseClick = 0x10005, kMouseRClick = 0x10006
     static let kScrollUp = 0x10007, kScrollDown = 0x10008
-    static let kLockScreen = 0x10009, kScreenshotAndLock = 0x1000A, kShutdownConfirm = 0x1000B, kInterrupt = 0x1000C
+    static let kLockScreen = 0x10009, kScreenshotAndLock = 0x1000A, kShutdownConfirm = 0x1000B, kInterrupt = 0x1000C, kShowDesktop = 0x1000D
     static let specials: [(name: String, code: Int)] = [
         ("鼠标 ↑", kMouseUp), ("鼠标 ↓", kMouseDown), ("鼠标 ←", kMouseLeft), ("鼠标 →", kMouseRight),
         ("鼠标左键", kMouseClick), ("鼠标右键", kMouseRClick),
         ("滚轮 ↑", kScrollUp), ("滚轮 ↓", kScrollDown),
+        ("显示桌面（主页）", kShowDesktop),
         ("锁定屏幕", kLockScreen), ("截屏后锁屏", kScreenshotAndLock), ("关机（确认）", kShutdownConfirm),
         ("中断当前终端（⌃C）", kInterrupt),
     ]
@@ -132,9 +133,9 @@ struct Config: Codable {
         0x4F:(0x7C,false,false,false,false),  // →
         0x28:(0x24,false,false,false,false),  // OK → Enter
         0xF1:(0x33,false,false,false,false),  // Back → Delete（按住连续删除）
-        0x4A:(0x23,true,false,false,false),   // Home → ⌘P（Cloud Coding 快速打开）
+        0x4A:(KeyNames.kShowDesktop,false,false,false,false), // Home → 显示桌面（主页）
         0x65:(0x35,false,false,false,false),  // Menu → Esc
-        0x66:(KeyNames.kScreenshotAndLock,false,false,false,false), // Power → 截屏后锁屏
+        0x66:(KeyNames.kLockScreen,false,false,false,false), // Power → 仅锁屏
         // 0x35 TV 键、0x66 电源、0x80/0x81 音量 ± 保持原键（不拦截）
         // macOS 自带的音量调节和电源弹窗即可用
     ]
@@ -183,6 +184,29 @@ final class ConfigStore {
            cfg.buttons[menu].longPressKeycode == nil {
             cfg.buttons[menu].longPressKeycode = KeyNames.kInterrupt
         }
+        // Migrate only the former factory defaults; a user's custom Home or
+        // Power mapping is never overwritten.
+        var migrated = false
+        if let home = cfg.buttons.firstIndex(where: { $0.usage == 0x4A }),
+           cfg.buttons[home].keycode == 0x23,
+           cfg.buttons[home].cmd,
+           !cfg.buttons[home].shift,
+           !cfg.buttons[home].opt,
+           !cfg.buttons[home].ctrl {
+            cfg.buttons[home].keycode = KeyNames.kShowDesktop
+            cfg.buttons[home].cmd = false
+            migrated = true
+        }
+        if let power = cfg.buttons.firstIndex(where: { $0.usage == 0x66 }),
+           cfg.buttons[power].keycode == KeyNames.kScreenshotAndLock,
+           !cfg.buttons[power].cmd,
+           !cfg.buttons[power].shift,
+           !cfg.buttons[power].opt,
+           !cfg.buttons[power].ctrl {
+            cfg.buttons[power].keycode = KeyNames.kLockScreen
+            migrated = true
+        }
+        if migrated { save(cfg) }
         return cfg
     }
     static func save(_ cfg: Config) {
