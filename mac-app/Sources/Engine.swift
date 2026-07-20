@@ -185,6 +185,7 @@ final class Engine: ObservableObject {
     private var deleteRepeatStartedAt: TimeInterval = 0
     private var lastDeleteRepeatAt: TimeInterval = 0
     private var keyMonitor: Any?
+    private var localFnDown = false
 
     // event tap
     private var tap: CFMachPort?
@@ -382,7 +383,21 @@ final class Engine: ObservableObject {
     private func installKeyCapture() {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] ev in
-            guard let self = self, self.capturingUsage != nil else { return ev }
+            guard let self else { return ev }
+            // A real keyboard Fn/Globe press means the user is about to use a
+            // Mac-native voice feature. Route that feature to the built-in mic.
+            // Remote voice is distinguished by the BLE/HID state and continues
+            // to use BlackHole; its voiceButton handler switches it back.
+            if ev.type == .flagsChanged, ev.keyCode == 0x3F {
+                let down = ev.modifierFlags.contains(.function)
+                if down && !self.localFnDown && !self.voiceHidDown {
+                    self.localFnDown = true
+                    self.selectBuiltInMicrophone()
+                } else if !down {
+                    self.localFnDown = false
+                }
+            }
+            guard self.capturingUsage != nil else { return ev }
             let loneMods: Set<UInt16> = [0x36,0x37,0x38,0x3C,0x3A,0x3D,0x3B,0x3E,0x39,0x3F]
             let f = ev.modifierFlags
             if ev.type == .keyDown {
@@ -489,6 +504,25 @@ final class Engine: ObservableObject {
                                                 UInt32(MemoryLayout<AudioDeviceID>.size), &selected)
         blackholeSelectedAsInput = status == noErr && Self.defaultInputDevice() == device
         L(blackholeSelectedAsInput ? "✅ 已自动选择 BlackHole 为系统输入" : "⚠️ BlackHole 已检测到，但设为系统输入失败 (OSStatus \(status))")
+    }
+
+    /// Switch to the Mac's actual built-in input device for a physical Fn/Globe
+    /// voice action. Selecting by CoreAudio transport avoids locale-dependent
+    /// device names such as “MacBook Air麦克风”.
+    func selectBuiltInMicrophone() {
+        guard let device = Self.builtInInputDevice() else {
+            L("⚠️ 未找到 Mac 内建麦克风，保持当前系统输入")
+            return
+        }
+        var selected = device
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil,
+                                                UInt32(MemoryLayout<AudioDeviceID>.size), &selected)
+        blackholeSelectedAsInput = false
+        L(status == noErr ? "🎙️ 本机 Fn 已切换到 Mac 内建麦克风" : "⚠️ 切换 Mac 内建麦克风失败 (OSStatus \(status))")
     }
     /// Explicit retry actions for the one-time initial TCC request. Repeated
     /// automatic prompts are noisy and macOS ignores them after the first denial.
@@ -613,6 +647,33 @@ final class Engine: ObservableObject {
             mElement: kAudioObjectPropertyElementMain)
         let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
         return status == noErr && device != 0 ? device : nil
+    }
+
+    static func builtInInputDevice() -> AudioDeviceID? {
+        var size = UInt32(0)
+        var allDevices = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                                    mScope: kAudioObjectPropertyScopeGlobal,
+                                                    mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &allDevices, 0, nil, &size) == noErr else { return nil }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &allDevices, 0, nil, &size, &ids) == noErr else { return nil }
+        for id in ids {
+            var transport: UInt32 = 0
+            var transportAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+                                                               mScope: kAudioObjectPropertyScopeGlobal,
+                                                               mElement: kAudioObjectPropertyElementMain)
+            var transportSize = UInt32(MemoryLayout<UInt32>.size)
+            guard AudioObjectGetPropertyData(id, &transportAddress, 0, nil, &transportSize, &transport) == noErr,
+                  transport == kAudioDeviceTransportTypeBuiltIn else { continue }
+            var streamsAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
+                                                             mScope: kAudioDevicePropertyScopeInput,
+                                                             mElement: kAudioObjectPropertyElementMain)
+            var streamsSize = UInt32(0)
+            if AudioObjectGetPropertyDataSize(id, &streamsAddress, 0, nil, &streamsSize) == noErr, streamsSize > 0 {
+                return id
+            }
+        }
+        return nil
     }
 
     // ---------- BLE (ATVV voice + mic) ----------
