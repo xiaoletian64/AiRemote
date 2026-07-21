@@ -24,11 +24,12 @@ enum KeyNames {
     static let kMouseUp = 0x10001, kMouseDown = 0x10002, kMouseLeft = 0x10003, kMouseRight = 0x10004
     static let kMouseClick = 0x10005, kMouseRClick = 0x10006
     static let kScrollUp = 0x10007, kScrollDown = 0x10008
-    static let kLockScreen = 0x10009, kScreenshotAndLock = 0x1000A, kShutdownConfirm = 0x1000B, kInterrupt = 0x1000C, kShowDesktop = 0x1000D, kOpenNotes = 0x1000E
+    static let kLockScreen = 0x10009, kScreenshotAndLock = 0x1000A, kShutdownConfirm = 0x1000B, kInterrupt = 0x1000C, kShowDesktop = 0x1000D, kOpenNotes = 0x1000E, kVolumeUp = 0x1000F, kVolumeDown = 0x10010
     static let specials: [(name: String, code: Int)] = [
         ("鼠标 ↑", kMouseUp), ("鼠标 ↓", kMouseDown), ("鼠标 ←", kMouseLeft), ("鼠标 →", kMouseRight),
         ("鼠标左键", kMouseClick), ("鼠标右键", kMouseRClick),
         ("滚轮 ↑", kScrollUp), ("滚轮 ↓", kScrollDown),
+        ("音量 +", kVolumeUp), ("音量 −", kVolumeDown),
         ("显示桌面（主页）", kShowDesktop),
         ("打开备忘录", kOpenNotes),
         ("锁定屏幕", kLockScreen), ("截屏后锁屏", kScreenshotAndLock), ("关机（确认）", kShutdownConfirm),
@@ -137,7 +138,8 @@ enum XiaomiRemoteHIDParser {
     }
 
     /// Consumer Control(0x0C) usage -> 内部统一 usage（与 Config.known 对齐）
-    private static let consumerToInternal: [UInt8: UInt8] = [
+    /// 设为内部可见：handleHIDValue 需要把 Consumer page 事件翻译成内部 usage 后再走映射。
+    static let consumerToInternal: [UInt8: UInt8] = [
         0x30: 0x66,   // Power
         0x40: 0x65,   // Menu
         0x45: 0x28,   // OK / Play→Enter（部分遥控器 OK 走 Consumer）
@@ -241,12 +243,16 @@ struct Config: Codable {
         0x50:(0x7B,false,false,false,false),  // ←
         0x4F:(0x7C,false,false,false,false),  // →
         0x28:(0x24,false,false,false,false),  // OK → Enter
-        0xF1:(0x33,false,false,false,false),  // Back → Delete（按住连续删除）
+        0xF1:(0x33,false,false,false,false),  // Back → Delete（单击删 1 个，按住连续删除）
         0x4A:(KeyNames.kOpenNotes,false,false,false,false),   // Home → 打开备忘录
         0x65:(0x35,false,false,false,false),  // Menu → Esc
         0x66:(KeyNames.kLockScreen,false,false,false,false), // Power → 仅锁屏
-        // 0x35 TV 键、0x66 电源、0x80/0x81 音量 ± 保持原键（不拦截）
-        // macOS 自带的音量调节和电源弹窗即可用
+        0x80:(KeyNames.kVolumeUp,false,false,false,false),   // 音量 + → CoreAudio 调系统音量
+        0x81:(KeyNames.kVolumeDown,false,false,false,false), // 音量 − → CoreAudio 调系统音量
+        // 0x35 TV 键、0x66 电源 保持原键（不拦截）；macOS 自带的电源弹窗即可用。
+        // 音量键的原始 HID 事件被内核 No-Event 吞掉（见 VoiceGlobeMapper），App 在
+        // value callback（内核映射之前）读到原始 usage 后用 CoreAudio 合成调音量，
+        // 不依赖系统收到 HID 事件。
     ]
     static var defaultConfig: Config {
         let btns = known.map { k -> ButtonMapping in
@@ -290,7 +296,7 @@ final class ConfigStore {
         // Upgrade original defaults created before the Mac-only control scheme.
         // This runs once per install so later user changes in the mapping UI stay intact.
         let defaultsVersionKey = "mappingDefaultsVersion"
-        if UserDefaults.standard.integer(forKey: defaultsVersionKey) < 6 {
+        if UserDefaults.standard.integer(forKey: defaultsVersionKey) < 7 {
             func installDefault(_ usage: Int, keycode: Int, cmd: Bool = false, longPress: Int? = nil) {
                 guard let i = cfg.buttons.firstIndex(where: { $0.usage == usage }) else { return }
                 cfg.buttons[i].keycode = keycode
@@ -304,8 +310,11 @@ final class ConfigStore {
             installDefault(0x4A, keycode: KeyNames.kOpenNotes)          // Home → 打开备忘录（短按即打开）
             installDefault(0x65, keycode: 0x35, longPress: KeyNames.kInterrupt) // Menu → Esc / ⌃C
             installDefault(0x66, keycode: KeyNames.kLockScreen, longPress: KeyNames.kShutdownConfirm)
-            // v6：Home 改为短按直接打开备忘录（原来短按是 ⌘V 粘贴）。
-            UserDefaults.standard.set(6, forKey: defaultsVersionKey)
+            // v7：音量键此前默认 kNone（保持原键），但内核 No-Event 吞了原始事件导致音量键完全失效。
+            // 改为 CoreAudio 合成调系统音量。仅当用户未自定义（仍是 kNone）时覆盖。
+            installDefault(0x80, keycode: KeyNames.kVolumeUp)
+            installDefault(0x81, keycode: KeyNames.kVolumeDown)
+            UserDefaults.standard.set(7, forKey: defaultsVersionKey)
             save(cfg)
         }
         // Keep the original Menu → Esc default usable for configurations saved

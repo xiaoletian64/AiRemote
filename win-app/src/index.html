@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小米超级键盘</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: #f5f5f7; color: #1d1d1f; min-height: 100vh;
+}
+.app { max-width: 860px; margin: 0 auto; padding: 20px; }
+.header { text-align: center; margin-bottom: 20px; }
+.header h1 { font-size: 28px; font-weight: 700; }
+.header p { color: #6e6e73; margin-top: 4px; font-size: 14px; }
+
+.status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+.card { background: #fff; border-radius: 14px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.card h3 { font-size: 14px; color: #6e6e73; margin-bottom: 6px; }
+.card .detail { font-size: 16px; font-weight: 500; }
+.card.ready .detail { color: #34c759; }
+.card-icon { font-size: 24px; margin-bottom: 8px; }
+
+.tabs { display: flex; gap: 8px; margin-bottom: 16px; background: #fff; border-radius: 12px; padding: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.tab { flex: 1; padding: 10px; text-align: center; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; color: #6e6e73; transition: all 0.2s; }
+.tab.active { background: #007aff; color: #fff; }
+
+.voice-section { background: #fff; border-radius: 14px; padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.voice-section h3 { font-size: 16px; margin-bottom: 10px; }
+.voice-modes { display: flex; flex-direction: column; gap: 8px; }
+.voice-mode { display: flex; align-items: center; gap: 10px; padding: 10px; border: 2px solid #e5e5ea; border-radius: 10px; cursor: pointer; }
+.voice-mode.active { border-color: #007aff; background: #f0f7ff; }
+.voice-mode label { font-size: 14px; font-weight: 500; cursor: pointer; }
+.voice-mode .detail { font-size: 12px; color: #8e8e93; display: block; margin-top: 2px; }
+.voice-mode input { width: 18px; height: 18px; }
+
+.mapping-list { background: #fff; border-radius: 14px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.mapping-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid #f2f2f7; }
+.mapping-row:last-child { border-bottom: none; }
+.mapping-icon { font-size: 20px; width: 32px; text-align: center; }
+.mapping-name { font-weight: 500; min-width: 100px; }
+.mapping-value { color: #8e8e93; font-size: 14px; margin-left: auto; }
+
+.log-view { background: #1d1d1f; color: #e5e5ea; border-radius: 10px; padding: 12px; font-family: monospace; font-size: 12px; max-height: 300px; overflow-y: auto; }
+.log-view div { line-height: 1.6; }
+
+.btn { padding: 8px 16px; border-radius: 8px; border: none; font-size: 14px; font-weight: 500; cursor: pointer; }
+.btn-primary { background: #007aff; color: #fff; }
+.hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <h1>⌨️ 小米超级键盘</h1>
+    <p>小米蓝牙遥控器 · Windows 版</p>
+  </div>
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('use', this)">使用</div>
+    <div class="tab" onclick="switchTab('mapping', this)">按键</div>
+    <div class="tab" onclick="switchTab('settings', this)">设置</div>
+  </div>
+
+  <div id="tab-use">
+    <div class="status-grid">
+      <div class="card" id="card-remote"><div class="card-icon">📺</div><h3>遥控器</h3><div class="detail">等待连接</div></div>
+      <div class="card" id="card-voice"><div class="card-icon">🎤</div><h3>语音键</h3><div class="detail">未设置</div></div>
+    </div>
+    <div class="card" style="margin-bottom:12px;">
+      <h3>📋 使用说明</h3>
+      <div style="font-size:14px;color:#6e6e73;margin-top:8px;line-height:1.8;">
+        1. 把遥控器和 Windows 蓝牙配对（系统设置 → 蓝牙 → 添加设备）<br>
+        2. 配对后遥控器自动连接，按键即可使用<br>
+        3. 在「按键」页选语音键模式（Win+H 听写 / Ctrl / Win / 麦克风开关）<br>
+        4. 要用语音转麦克风：安装 VB-Cable（设置页有链接）
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="rescan()">重新扫描设备</button>
+  </div>
+
+  <div id="tab-mapping" class="hidden">
+    <div class="voice-section">
+      <h3>🎤 语音键映射模式（Windows 适配）</h3>
+      <div class="voice-modes" id="voice-modes"></div>
+    </div>
+    <div class="mapping-list" id="mapping-list"></div>
+  </div>
+
+  <div id="tab-settings" class="hidden">
+    <div class="card" style="margin-bottom:12px;">
+      <h3>🎙️ 语音转麦克风（VB-Cable）</h3>
+      <div style="font-size:14px;color:#6e6e73;margin-top:8px;">
+        安装 VB-Cable 虚拟声卡后，遥控器语音可作为 Windows 麦克风输入。<br>
+        下载：<a href="https://vb-audio.com/Cable/" target="_blank">VB-Audio Cables 官网</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>📋 诊断日志</h3>
+      <div class="log-view" id="log-view"><div>日志加载中…</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const { invoke } = window.__TAURI__.core;
+let currentConfig = null;
+
+function switchTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('[id^="tab-"]').forEach(e => e.classList.add('hidden'));
+  el.classList.add('active');
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  if (name === 'settings') loadLog();
+  if (name === 'mapping') loadMapping();
+}
+
+async function loadConfig() {
+  currentConfig = await invoke('get_config');
+  const remote = document.getElementById('card-remote');
+  remote.querySelector('.detail').textContent = '已连接（HID 监听中）';
+  remote.classList.add('ready');
+  invoke('get_voice_modes').then(modes => {
+    const m = modes.find(mo => mo[0] === currentConfig.voice_mode);
+    const voice = document.getElementById('card-voice');
+    voice.querySelector('.detail').textContent = m ? m[1] : '未设置';
+    voice.classList.add('ready');
+    loadVoiceModes(modes);
+  });
+}
+
+async function loadVoiceModes(modes) {
+  if (!modes) modes = await invoke('get_voice_modes');
+  const container = document.getElementById('voice-modes');
+  container.innerHTML = modes.map(m => `
+    <div class="voice-mode ${currentConfig.voice_mode === m[0] ? 'active' : ''}" onclick="setVoiceMode('${m[0]}')">
+      <input type="radio" ${currentConfig.voice_mode === m[0] ? 'checked' : ''}>
+      <div><label>${m[1]}</label><span class="detail">${m[2]}</span></div>
+    </div>`).join('');
+}
+
+async function setVoiceMode(mode) {
+  await invoke('set_voice_mode', { mode });
+  await loadConfig();
+}
+
+async function loadMapping() {
+  if (!currentConfig) currentConfig = await invoke('get_config');
+  const list = document.getElementById('mapping-list');
+  const icons = {0x52:'⬆️',0x51:'⬇️',0x50:'⬅️',0x4F:'➡️',0x28:'✅',0xF1:'⬅️',0x4A:'🏠',0x65:'☰',0x35:'📺',0x66:'⏻',0x80:'🔊',0x81:'🔉'};
+  list.innerHTML = currentConfig.buttons.map(b => {
+    let action = '保持原样';
+    if (b.special >= 65536) action = '特殊动作';
+    else if (b.vk !== 65535) action = 'VK 0x' + b.vk.toString(16).toUpperCase();
+    return `<div class="mapping-row">
+      <div class="mapping-icon">${icons[b.usage] || '🔘'}</div>
+      <div class="mapping-name">${b.name}</div>
+      <div class="mapping-value">${action}</div>
+    </div>`;
+  }).join('');
+}
+
+async function loadLog() {
+  const log = await invoke('get_log');
+  document.getElementById('log-view').innerHTML =
+    log.length ? log.map(l => `<div>${l}</div>`).join('') : '<div>暂无日志</div>';
+}
+
+async function rescan() { await invoke('rescan'); alert('正在重新扫描…'); }
+
+loadConfig();
+setInterval(() => loadConfig(), 3000);
+</script>
+</body>
+</html>
