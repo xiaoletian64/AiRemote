@@ -1,0 +1,40 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [feat/multi-remote-and-voicekey]
+    paths: ['win-app/**', '.github/workflows/build-windows.yml']
+  pull_request:
+    paths: ['win-app/**']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0"
+
+      - name: Build Windows EXE
+        working-directory: win-app/src-tauri
+        run: cargo tauri build --target x86_64-pc-windows-msvc
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 小米超级键盘-Windows
+          path: |
+            win-app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            win-app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            win-app/src-tauri/target/x86_64-pc-windows-msvc/release/*.exe
+          if-no-files-found: ignore
