@@ -4,10 +4,12 @@ mod hid;
 mod mapping;
 mod adpcm;
 mod dsp;
+mod diagnostics;
 
 use config::{Config, VoiceMode};
 use mapping::KeyMapper;
 use hid::HidListener;
+use diagnostics::Diagnostics;
 use std::sync::{Arc, Mutex};
 use tauri::State;
 
@@ -17,17 +19,12 @@ struct AppState {
     key_mapper: Arc<Mutex<KeyMapper>>,
     hid: Arc<Mutex<Option<HidListener>>>,
     connected: Arc<Mutex<bool>>,
-    log: Arc<Mutex<Vec<String>>>,
+    log: Diagnostics,
 }
 
 /// 日志辅助
 fn log_msg(state: &AppState, msg: String) {
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
-    let line = format!("{}  {}", timestamp, msg);
-    log::info!("{}", line);
-    let mut log = state.log.lock().unwrap();
-    log.push(line);
-    if log.len() > 200 { log.remove(0); }
+    diagnostics::record(&state.log, msg);
 }
 
 // ===== Tauri 命令（前端调用）=====
@@ -58,6 +55,11 @@ fn get_log(state: State<AppState>) -> Vec<String> {
     state.log.lock().unwrap().clone()
 }
 
+#[tauri::command]
+fn get_diagnostic_log_path() -> String {
+    diagnostics::log_path().display().to_string()
+}
+
 /// 设置语音键模式
 #[tauri::command]
 fn set_voice_mode(state: State<AppState>, mode: VoiceMode) {
@@ -79,8 +81,24 @@ fn get_voice_modes() -> Vec<(String, String, String)> {
 
 /// 重新扫描设备
 #[tauri::command]
-fn rescan(state: State<AppState>) {
-    log_msg(&state, "重新扫描设备…".to_string());
+fn rescan(state: State<AppState>) -> Vec<String> {
+    log_msg(&state, "用户请求重新扫描 HID 设备".to_string());
+    match HidListener::scan_known_devices() {
+        Ok(devices) if devices.is_empty() => {
+            log_msg(&state, "重新扫描结果：没有候选遥控器接口".to_string());
+            devices
+        }
+        Ok(devices) => {
+            for device in &devices {
+                log_msg(&state, format!("重新扫描结果：{}", device));
+            }
+            devices
+        }
+        Err(error) => {
+            log_msg(&state, format!("重新扫描失败：{}", error));
+            Vec::new()
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -99,7 +117,12 @@ pub fn run() {
             let config = Arc::new(Mutex::new(Config::load()));
             let key_mapper = Arc::new(Mutex::new(KeyMapper::new(config.clone())));
             let connected = Arc::new(Mutex::new(false));
-            let log = Arc::new(Mutex::new(Vec::new()));
+            let log = diagnostics::new();
+            diagnostics::record(&log, format!(
+                "应用启动：version={} os={} arch={} diagnostics={}",
+                env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH,
+                diagnostics::log_path().display()
+            ));
 
             // 启动 HID 监听
             let mut hid = HidListener::new();
@@ -108,18 +131,14 @@ pub fn run() {
             {
                 let config_clone = config.clone();
                 let log_clone = log.clone();
-                hid.start(move |usage, is_down| {
+                hid.start(log.clone(), move |usage, is_down| {
                     *conn.lock().unwrap() = true;
                     let name = config_clone.lock().unwrap()
                         .find_mapping(usage)
                         .map(|m| m.name.clone())
                         .unwrap_or_else(|| format!("0x{:02x}", usage));
                     let action = if is_down { "按下" } else { "松开" };
-                    log_clone.lock().unwrap().push(format!(
-                        "{}  {} {}",
-                        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
-                        name, action
-                    ));
+                    diagnostics::record(&log_clone, format!("按键事件：{} {} (usage=0x{:02X})", name, action, usage));
                     if is_down {
                         km.lock().unwrap().on_key_down(usage);
                     } else {
@@ -137,7 +156,7 @@ pub fn run() {
             };
 
             app.manage(state);
-            log::info!("小米超级键盘 Windows 版已启动");
+            diagnostics::record(&app.state::<AppState>().log, "小米超级键盘 Windows 版已启动");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -145,6 +164,7 @@ pub fn run() {
             save_config,
             get_status,
             get_log,
+            get_diagnostic_log_path,
             set_voice_mode,
             get_voice_modes,
             rescan,
