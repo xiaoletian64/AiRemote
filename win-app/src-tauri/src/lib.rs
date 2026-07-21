@@ -11,7 +11,7 @@ use mapping::KeyMapper;
 use hid::HidListener;
 use diagnostics::Diagnostics;
 use std::sync::{Arc, Mutex};
-use tauri::State;
+use tauri::{Manager, State};
 
 /// 应用状态
 struct AppState {
