@@ -71,6 +71,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
         }
         menu.addItem(NSMenuItem(title: "重新扫描设备", action: #selector(reconnect(_:)), keyEquivalent: "r"))
+        // 全局暂停：一键拦截遥控器所有导航键（离开时防自发误触）
+        let pauseTitle = engine.remotePaused ? "▶️ 恢复遥控器" : "⏸ 暂停遥控器"
+        menu.addItem(NSMenuItem(title: pauseTitle, action: #selector(togglePause(_:)), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "显示主窗口", action: #selector(showMainWindow(_:)), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "查看日志", action: #selector(showLog(_:)), keyEquivalent: ""))
@@ -122,6 +125,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func disconnectDevice(_ sender: Any?) {
         engine.disconnectCurrentRemote()
+    }
+
+    @objc private func togglePause(_ sender: Any?) {
+        engine.toggleRemotePause()
     }
 
     @objc private func showLog(_ sender: Any?) {
