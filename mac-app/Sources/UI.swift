@@ -449,6 +449,26 @@ struct ContentView: View {
                     }
                 }
 
+                GroupBox("休眠与唤醒（防静置误触）") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("TV 键唤醒模式", isOn: Binding(
+                            get: { e.tvWakeEnabled },
+                            set: { e.setTvWakeEnabled($0) }
+                        ))
+                        .toggleStyle(.switch)
+                        if e.tvWakeEnabled {
+                            HStack(spacing: 6) {
+                                Image(systemName: e.remoteAwake ? "checkmark.circle.fill" : "moon.zzz.fill")
+                                    .foregroundStyle(e.remoteAwake ? .green : .orange)
+                                Text(e.remoteAwake ? "唤醒态（30 秒内无按键自动休眠）" : "休眠态（按 TV 键唤醒）")
+                                    .font(.caption)
+                            }
+                        }
+                        Text("开启后：遥控器 30 秒无按键自动进入休眠（拦截所有按键），按 TV 键唤醒。静置时 Pro 会自发按键噪声，TV 键静置不发，是可靠的唤醒信号。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
                 GroupBox("应用") {
                     VStack(alignment: .leading, spacing: 10) {
                         Toggle("登录时自动启动", isOn: Binding(get: { e.launchAtLogin }, set: e.setLaunchAtLogin))

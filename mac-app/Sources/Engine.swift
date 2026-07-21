@@ -276,6 +276,46 @@ final class Engine: ObservableObject {
     private var navKeyTimestamps: [TimeInterval] = []
     private var circuitBreakerActive = false           // 是否处于熔断态
     private var lastNavKeyAt: TimeInterval = 0         // 最近一次导航键事件时间（熔断静默判断用）
+    // 软件层休眠/唤醒状态机（TV 键唤醒）：
+    // 唤醒态：正常处理所有键。每次按键续期唤醒窗口。
+    // 休眠态：tap 拦截所有导航键；只有 TV 键（静置不自发，已验证）能唤醒。
+    // 默认启动即唤醒（首次使用无感）；30 秒无按键自动休眠。
+    @Published var remoteAwake: Bool = true
+    private var awakeUntil: TimeInterval = 0           // 唤醒有效期，到期自动休眠
+    private let awakeTimeout: TimeInterval = 30.0      // 30秒无按键进入休眠
+    // TV 唤醒开关：开启时启用休眠/唤醒状态机；关闭时保持常唤醒（传统行为）。
+    @Published var tvWakeEnabled: Bool = UserDefaults.standard.bool(forKey: "tvWakeEnabled")
+    func setTvWakeEnabled(_ on: Bool) {
+        tvWakeEnabled = on
+        UserDefaults.standard.set(on, forKey: "tvWakeEnabled")
+        if on {
+            remoteAwake = false  // 开启即进入休眠，需 TV 键唤醒
+            L("💤 TV 唤醒已开启：遥控器进入休眠，按 TV 键唤醒")
+        } else {
+            remoteAwake = true
+            L("▶️ TV 唤醒已关闭：遥控器保持常唤醒")
+        }
+    }
+    /// TV 键唤醒（由 handleHIDReport 收到 usage 0x35 时调用）
+    func wakeByTVKey() {
+        guard tvWakeEnabled else { return }
+        remoteAwake = true
+        awakeUntil = ProcessInfo.processInfo.systemUptime + awakeTimeout
+        L("🔔 TV 键唤醒，30 秒内正常处理按键")
+    }
+    /// 续期唤醒（唤醒期内有合法按键时调用）
+    private func keepAwake() {
+        guard tvWakeEnabled, remoteAwake else { return }
+        awakeUntil = ProcessInfo.processInfo.systemUptime + awakeTimeout
+    }
+    /// 检查是否该自动休眠（定时器调用）
+    func checkAutoSleep() {
+        guard tvWakeEnabled, remoteAwake else { return }
+        if ProcessInfo.processInfo.systemUptime > awakeUntil {
+            remoteAwake = false
+            L("💤 30 秒无按键，遥控器进入休眠（按 TV 键唤醒）")
+        }
+    }
     // 全局暂停开关：开启时 tap 拦截所有导航/编辑类键（菜单栏一键，离开时用）。
     @Published var remotePaused: Bool = false
     func toggleRemotePause() {
@@ -377,6 +417,8 @@ final class Engine: ObservableObject {
                 } else {
                     self.audioWatchdog()
                 }
+                // TV 唤醒状态机：检查是否该自动休眠（30秒无按键）
+                self.checkAutoSleep()
             }
         }
     }
@@ -1616,6 +1658,13 @@ final class Engine: ObservableObject {
         let msg = String(format: "0x%02x [%@] → %@", usage, m.name, m.display)
         L(msg)
         self.flashKey(label: m.name, mapping: m.display)
+        // TV 键(0x35) 唤醒：静置时不自发（已验证），是可靠的"用户在场"信号。
+        // 按下 TV 键即唤醒遥控器（解除休眠态），TV 键本身不触发其他动作。
+        if Int(usage) == 0x35 {
+            wakeByTVKey()
+            downButtonUsage = Int(usage); downTarget = nil
+            return
+        }
         if m.keycode == KeyNames.kNone { downButtonUsage = Int(usage); downTarget = nil; return }
         if Int(usage) == 0xF1 && m.keycode == 0x33 {
             // Back 改为「仅长按删除」：单击不删除（避免拿起遥控器/手指抖动误触），
@@ -1781,6 +1830,16 @@ final class Engine: ObservableObject {
             if remotePaused && Self.navKeycodes.contains(kc) {
                 suppress = true
                 return
+            }
+            // ② 休眠态（TV 唤醒状态机）：休眠时拦截所有导航键，只有 TV 键能唤醒（TV 唤醒走
+            // IOHIDManager usage 0x35，不经过 tap）。唤醒期内放行并续期。
+            if tvWakeEnabled && !remoteAwake && Self.navKeycodes.contains(kc) {
+                suppress = true
+                return
+            }
+            // 唤醒期内有合法导航键，续期（防止操作中途进入休眠）
+            if tvWakeEnabled && remoteAwake && Self.navKeycodes.contains(kc) {
+                awakeUntil = now + awakeTimeout
             }
             // ② 速率熔断（持续拦截直到静默）：导航/编辑类键在 2 秒内 ≥8 次，
             // 判定设备异常（Pro 静置自发特征）。触发后持续拦截，直到连续 10 秒

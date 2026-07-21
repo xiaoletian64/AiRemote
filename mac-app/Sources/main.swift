@@ -57,7 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let devName = currentRemoteName
-        let state = engine.micStreaming ? "正在转发语音" : (engine.remoteConnected ? "已连接" : "未连接")
+        var state = engine.micStreaming ? "正在转发语音" : (engine.remoteConnected ? "已连接" : "未连接")
+        if engine.tvWakeEnabled && !engine.remoteAwake { state = "休眠中（按TV键唤醒）" }
         let stateItem = NSMenuItem(title: "\(devName) · \(state)", action: nil, keyEquivalent: "")
         stateItem.isEnabled = false
         menu.addItem(stateItem)
