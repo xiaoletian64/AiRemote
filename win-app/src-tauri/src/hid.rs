@@ -124,7 +124,7 @@ impl HidListener {
                                 let mut buf = [0u8; 256];
                                 while *running.lock().unwrap() {
                                     // 读报告（超时 1 秒，避免永久阻塞）
-                                    match device.read_timeout(1000) {
+                                    match device.read_timeout(&mut buf, 1000) {
                                         Ok(size) if size > 0 => {
                                             let data = &buf[..size];
                                             let raw = data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");

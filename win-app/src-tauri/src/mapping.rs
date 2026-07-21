@@ -1,9 +1,59 @@
 // mapping.rs — 按键映射 + 合成事件 + 特殊动作（移植自 Mac 版 Engine.swift）
 use crate::config::{self, vk, ButtonMapping, Config, SPECIAL_BASE};
-use enigo::{Enigo, Key, KeyboardControllable, MouseControllable, MouseButton};
+use enigo::{Axis, Button as MouseButton, Direction, Enigo, Key as EnigoKey, Keyboard, Mouse, Settings};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::thread;
+
+// Enigo 0.2 将旧版的 key_down/key_up/mouse_click API 统一为带 Direction 的
+// Keyboard/Mouse trait。保留这一层小适配器，让映射逻辑保持按下/松开语义清晰。
+enum Key {
+    Raw(u16),
+    Control,
+    Super,
+    Shift,
+    Alt,
+}
+
+trait LegacyInput {
+    fn key_down(&mut self, key: Key);
+    fn key_up(&mut self, key: Key);
+}
+
+impl LegacyInput for Enigo {
+    fn key_down(&mut self, key: Key) {
+        send_key(self, key, Direction::Press);
+    }
+
+    fn key_up(&mut self, key: Key) {
+        send_key(self, key, Direction::Release);
+    }
+}
+
+fn send_key(enigo: &mut Enigo, key: Key, direction: Direction) {
+    match key {
+        Key::Raw(code) => { let _ = enigo.raw(code, direction); }
+        Key::Control => { let _ = enigo.key(EnigoKey::Control, direction); }
+        Key::Super => { let _ = enigo.key(EnigoKey::Meta, direction); }
+        Key::Shift => { let _ = enigo.key(EnigoKey::Shift, direction); }
+        Key::Alt => { let _ = enigo.key(EnigoKey::Alt, direction); }
+    }
+}
+
+trait LegacyMouse {
+    fn mouse_click(&mut self, button: MouseButton);
+    fn mouse_scroll_y(&mut self, amount: i32);
+}
+
+impl LegacyMouse for Enigo {
+    fn mouse_click(&mut self, button: MouseButton) {
+        let _ = self.button(button, Direction::Click);
+    }
+
+    fn mouse_scroll_y(&mut self, amount: i32) {
+        let _ = self.scroll(amount, Axis::Vertical);
+    }
+}
 
 /// 按键处理器：接收 HID usage，执行映射
 pub struct KeyMapper {
@@ -18,7 +68,9 @@ impl KeyMapper {
     pub fn new(config: Arc<Mutex<Config>>) -> Self {
         Self {
             config,
-            enigo: Arc::new(Mutex::new(Enigo::new())),
+            enigo: Arc::new(Mutex::new(
+                Enigo::new(&Settings::default()).expect("无法初始化 Windows 输入模拟"),
+            )),
             delete_repeating: Arc::new(Mutex::new(false)),
             delete_thread_handle: None,
         }
