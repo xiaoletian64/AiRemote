@@ -1604,11 +1604,14 @@ final class Engine: ObservableObject {
             if voiceHidDown { voiceHidDown = false; lastHidKeycodeAt[HIDMap.voiceKeycode] = now }
             if let t = downTarget {
                 if t.usage == 0xF1 && t.keycode == 0x33 {
-                    // Back（删除键）脉冲时长诊断：<35ms 视为抖动脉冲。
-                    // 删除定时器已在上面 invalidate，短脉冲不会触发删除。
+                    // Back（删除键）：down 时已发过单击的 keyDown+keyUp，连续删除期间
+                    // 发的也都是完整 down/up 对，所以松开只需停定时器，不再补 keyUp。
+                    // deleteRepeatTimer 已在上面 invalidate，这里只做脉冲时长诊断。
                     let pulseMs = Int((now - backDownAt) * 1000)
                     if pulseMs < 35 {
                         L("Back(删除) 短脉冲 \(pulseMs)ms，视为抖动忽略")
+                    } else if deleteRepeatTimer != nil {
+                        L("Back(删除) 连续删除停止（按下 \(pulseMs)ms）")
                     } else {
                         L("Back(删除) 松开（按下 \(pulseMs)ms）")
                     }
@@ -1681,7 +1684,19 @@ final class Engine: ObservableObject {
             backDownAt = now
             downButtonUsage = Int(usage); downTarget = m
             L("OK(删除) 已按下，按住 0.4 秒后开始删除…")
-            startDeleteRepeat()
+            startDeleteRepeat(usage: 0x28)
+            return
+        }
+        if Int(usage) == 0xF1 && m.keycode == 0x33 {
+            // Back「单击删 1 个 + 长按连续删除」：down 时先发一次完整 keyDown+keyUp
+            // 作为单击的那一下；同时启动 0.4s 延迟的连续删除定时器。松开时停定时器即可
+            // （单击的 keyUp 已在 down 时发过，连续删除期间发的都是完整 down/up 对）。
+            backDownAt = now
+            downButtonUsage = Int(usage); downTarget = m
+            postKey(0x33, down: true, cmd: false)
+            postKey(0x33, down: false, cmd: false)
+            L("Back(删除) 已按下，按住 0.4 秒后开始连续删除…")
+            startDeleteRepeat(usage: 0xF1)
             return
         }
         // 方向键/OK/Menu 等普通按键：延迟 40ms 确认，过滤 <40ms 的抖动脉冲（拿起误触）。
@@ -1740,7 +1755,11 @@ final class Engine: ObservableObject {
         else if keycode != KeyNames.kNone { postKey(CGKeyCode(keycode), down: down, cmd: mapping.cmd, shift: mapping.shift, opt: mapping.opt, ctrl: mapping.ctrl) }
     }
 
-    private func startDeleteRepeat() {
+    /// 启动长按连续删除定时器。
+    /// - 参数 usage：触发删除的 usage（0x28 = OK，0xF1 = Back）。两者共用同一套
+    ///   "0.4s 后开始 → 越删越快"的手感；OK 是"仅长按删除"（单击不删），Back 是
+    ///   "单击删 1 个 + 长按连续"（down 路径已先发过单击的 keyDown+keyUp）。
+    private func startDeleteRepeat(usage: Int) {
         deleteRepeatTimer?.invalidate()
         deleteRepeatStartedAt = ProcessInfo.processInfo.systemUptime
         lastDeleteRepeatAt = deleteRepeatStartedAt
@@ -1750,7 +1769,7 @@ final class Engine: ObservableObject {
         // 首延迟 0.4s：配合"仅长按删除"——拿起抖动脉冲通常 <300ms，400ms 足以过滤；
         // 真实长按 0.4s 后才开始删，响应仍够快。
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self = self, self.downButtonUsage == 0x28 else { return }
+            guard let self = self, self.downButtonUsage == usage else { return }
             // 动态间隔：用可变状态而非闭包常量，每删一次就收缩一次
             var interval: Float = 0.12        // 起始 0.12s（~8 次/秒，慢，能看清一个个删）
             let minInterval: Float = 0.022    // 收尾 0.022s（~45 次/秒，飞快）
@@ -1758,7 +1777,7 @@ final class Engine: ObservableObject {
             self.lastDeleteRepeatAt = ProcessInfo.processInfo.systemUptime
             self.deleteRepeatTimer = Timer.scheduledTimer(withTimeInterval: 0.005, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    guard let self = self, self.downButtonUsage == 0x28 else { return }
+                    guard let self = self, self.downButtonUsage == usage else { return }
                     let now = ProcessInfo.processInfo.systemUptime
                     guard now - self.lastDeleteRepeatAt >= TimeInterval(interval) else { return }
                     self.lastDeleteRepeatAt = now
