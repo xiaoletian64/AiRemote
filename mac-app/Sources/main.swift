@@ -62,9 +62,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stateItem.isEnabled = false
         menu.addItem(stateItem)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "显示主窗口", action: #selector(showMainWindow(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "重新连接遥控器", action: #selector(reconnect(_:)), keyEquivalent: "r"))
+        // 连接/断开：根据当前状态动态显示
+        if engine.remoteConnected {
+            menu.addItem(NSMenuItem(title: "断开设备", action: #selector(disconnectDevice(_:)), keyEquivalent: ""))
+        } else {
+            let item = NSMenuItem(title: "连接设备", action: #selector(connectDevice(_:)), keyEquivalent: "")
+            item.isEnabled = engine.selectedRemoteID != nil || !engine.discoveredRemotes.isEmpty
+            menu.addItem(item)
+        }
+        menu.addItem(NSMenuItem(title: "重新扫描设备", action: #selector(reconnect(_:)), keyEquivalent: "r"))
         menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "显示主窗口", action: #selector(showMainWindow(_:)), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "查看日志", action: #selector(showLog(_:)), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "重启 App", action: #selector(restartApp(_:)), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "退出小米超级键盘", action: #selector(quit(_:)), keyEquivalent: "q"))
         for item in menu.items { item.target = self }
     }
@@ -103,6 +114,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func reconnect(_ sender: Any?) {
         engine.retryScan()
+    }
+
+    @objc private func connectDevice(_ sender: Any?) {
+        engine.connectSelectedRemote()
+    }
+
+    @objc private func disconnectDevice(_ sender: Any?) {
+        engine.disconnectCurrentRemote()
+    }
+
+    @objc private func showLog(_ sender: Any?) {
+        // 打开持久日志文件（控制台打开，便于查看带时间戳的事件流）
+        let logURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs/小米超级键盘/superkeyboard.log")
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            NSWorkspace.shared.open(logURL)
+        } else {
+            engine.L("⚠️ 日志文件不存在：\(logURL.path)")
+        }
+    }
+
+    @objc private func restartApp(_ sender: Any?) {
+        // 重启：先调度重新打开自己，再终止当前进程
+        let appURL = Bundle.main.bundleURL
+        engine.L("🔄 用户请求重启 App")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            NSApp.terminate(nil)
+        }
     }
 
     @objc private func quit(_ sender: Any?) {
