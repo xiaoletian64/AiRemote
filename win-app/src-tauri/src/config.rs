@@ -193,6 +193,8 @@ fn default_mapping(usage: u16) -> (u16, u32, u32) {
         0x4A => (0, SPECIAL_OPEN_NOTEPAD, 0), // Home → 打开记事本
         0x65 => (vk::ESCAPE, 0, SPECIAL_INTERRUPT), // Menu → Esc / 长按 Ctrl+C
         0x66 => (0, SPECIAL_LOCK_SCREEN, SPECIAL_SHUTDOWN_CONFIRM), // Power → 锁屏/关机
+        0x80 => (0xAF, 0, 0),          // Volume Up → VK_VOLUME_UP
+        0x81 => (0xAE, 0, 0),          // Volume Down → VK_VOLUME_DOWN
         _ => (VK_NONE, 0, 0),             // 其他保持原样
     }
 }
@@ -244,5 +246,17 @@ mod dirs {
         {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_mapping, VK_NONE};
+
+    #[test]
+    fn volume_buttons_use_windows_volume_virtual_keys() {
+        assert_eq!(default_mapping(0x80).0, 0xAF);
+        assert_eq!(default_mapping(0x81).0, 0xAE);
+        assert_ne!(default_mapping(0x80).0, VK_NONE);
     }
 }
