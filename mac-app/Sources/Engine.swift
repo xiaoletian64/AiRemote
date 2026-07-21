@@ -1514,9 +1514,19 @@ final class Engine: ObservableObject {
     /// IOHIDValue 回调处理（内核 hidutil 映射前读取，不受 No-Event 屏蔽影响）。
     /// 每个 HID 元素值变化触发一次，做 down/up 配对后调用 hidReport(usage:) 复用全部映射逻辑。
     private func handleHIDValue(page: UInt32, usage: UInt32, rawValue: Int) {
-        // 只处理 Keyboard page (0x07) 的已知按键 usage
-        guard page == 0x07 else { return }
-        let u = Int(usage)
+        // 同时处理两种报告页：
+        //   - Keyboard page (0x07)：小米主流形态，usage 直接是内部键码
+        //   - Consumer Control page (0x0C)：部分固件走此页（Volume+=0xE9 / Volume-=0xEA 等），
+        //     用 consumerToInternal 翻译成内部统一 usage 后复用同一套映射逻辑。
+        let u: Int
+        if page == 0x07 {
+            u = Int(usage)
+        } else if page == 0x0C {
+            guard let mapped = XiaomiRemoteHIDParser.consumerToInternal[UInt8(truncatingIfNeeded: usage)] else { return }
+            u = Int(mapped)
+        } else {
+            return
+        }
         let knownUsages: Set<Int> = [0x52, 0x51, 0x50, 0x4F, 0x28, 0xF1, 0x4A, 0x35, 0x65, 0x66, 0x3E, 0x80, 0x81]
         guard knownUsages.contains(u) else { return }
 
@@ -1962,6 +1972,21 @@ final class Engine: ObservableObject {
             postKey(0x08, down: true, cmd: false, ctrl: true) // ⌃C
             postKey(0x08, down: false, cmd: false)
             L("→ 已发送终端中断 ⌃C")
+        case KeyNames.kVolumeUp:
+            // 立即调一次，再起 0.18s 间隔的连续调节定时器；松开由 stopSpecial 兜底停掉。
+            adjustSystemVolume(step: 1)
+            specialCode = code
+            specialTimer?.invalidate()
+            specialTimer = Timer.scheduledTimer(withTimeInterval: 0.18, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.adjustSystemVolume(step: 1) }
+            }
+        case KeyNames.kVolumeDown:
+            adjustSystemVolume(step: -1)
+            specialCode = code
+            specialTimer?.invalidate()
+            specialTimer = Timer.scheduledTimer(withTimeInterval: 0.18, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.adjustSystemVolume(step: -1) }
+            }
         case KeyNames.kShutdownConfirm:
             confirmShutdown()
         default:
@@ -2042,6 +2067,52 @@ final class Engine: ObservableObject {
         if let e = CGEvent(scrollWheelEvent2Source: evSrc, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0) {
             e.setIntegerValueField(.eventSourceUserData, value: kSyntheticMarker)
             e.post(tap: .cghidEventTap)
+        }
+    }
+
+    // ---------- 系统音量（CoreAudio 合成，不依赖系统收到 HID 事件）----------
+    /// 遥控器音量键(0x80/0x81) 的原始 HID 事件被 VoiceGlobeMapper 在内核层映射成
+    /// No-Event 吞掉，系统收不到 → 无法走原生音量 HUD。App 在 value callback
+    /// （内核映射之前）能读到原始 usage，触发本方法用 CoreAudio 直接调系统默认
+    /// 输出设备的音量。步长 1/16（约 6.25%），按住通过 specialTimer 连续调节。
+    private static func defaultOutputDevice() -> AudioDeviceID? {
+        var device: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+        return status == noErr && device != 0 ? device : nil
+    }
+
+    /// 调系统默认输出设备音量。step ∈ {-1, +1}；读当前音量 → 加减 1/16 → 钳制 [0,1] → 写回。
+    /// 没有音量属性（HDMI/DisplayLink 等数字输出）时静默跳过，不刷屏。
+    private func adjustSystemVolume(step: Int) {
+        guard let dev = Self.defaultOutputDevice() else { return }
+        var vol: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,    // kAudioDevicePropertyScopeOutput
+            mElement: kAudioObjectPropertyElementMain)  // master channel = 0
+        // 先看 master channel (0) 有没有音量属性；没有再退到 channel 1（部分设备只有 per-channel volume）
+        var hasVolume = AudioObjectHasProperty(dev, &addr)
+        if !hasVolume {
+            addr.mElement = 1
+            hasVolume = AudioObjectHasProperty(dev, &addr)
+        }
+        guard hasVolume,
+              AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &vol) == noErr else { return }
+        let delta: Float32 = 1.0 / 16.0
+        vol = max(0, min(1, vol + Float32(step) * delta))
+        guard AudioObjectSetPropertyData(dev, &addr, 0, nil, size, &vol) == noErr else { return }
+        // per-channel：同步 channel 2（立体声右声道）
+        if addr.mElement == 1 {
+            var addr2 = addr; addr2.mElement = 2
+            if AudioObjectHasProperty(dev, &addr2) {
+                _ = AudioObjectSetPropertyData(dev, &addr2, 0, nil, size, &vol)
+            }
         }
     }
 
