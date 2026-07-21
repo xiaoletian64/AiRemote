@@ -20,6 +20,28 @@ final class VoiceGlobeMapper {
     private static let appleGlobeUsage: UInt64 = 0x0000_00FF_0000_0003
     // Keyboard/Keypad page (0x07), LeftControl usage (0xE0)
     private static let leftControlUsage: UInt64 = 0x0000_0007_0000_00E0
+    /// HID "No Event" 目标 usage：把源键映射到这里，内核层彻底吞掉，不产生任何键盘事件。
+    /// 参考 mi-ao 的 hidutil 方案（0x700000000）。
+    private static let noEventUsage: UInt64 = 0x0000_0007_0000_0000
+
+    /// 需要在内核层屏蔽的遥控器按键（Keyboard page 0x07 usage）。
+    /// 这些键映射成 No-Event 后，系统收不到它们的原始键盘事件（含自发噪声），
+    /// App 的 IOHIDManager 仍能读到报告触发映射动作，Mac 键盘不受影响（VID/PID 不匹配）。
+    /// 语音键(0x3E) 不在此列表——它单独映射成 Globe/LeftControl。
+    private static let neutralizedUsages: [UInt8] = [
+        0x52, 0x51, 0x50, 0x4F,  // 方向 上/下/左/右
+        0x28,                     // OK
+        0xF1,                     // Back
+        0x4A,                     // Home
+        0x35,                     // TV
+        0x65,                     // Menu
+        0x66,                     // Power
+        0x80, 0x81,               // 音量 +/-
+    ]
+    /// 把 usage 字节编码成完整 UInt64（page 0x07 左移 32 | usage）
+    private static func keyboardUsage(_ u: UInt8) -> UInt64 {
+        0x0000_0007_0000_0000 | UInt64(u)
+    }
 
     private struct Mapping {
         let source: UInt64
@@ -47,8 +69,8 @@ final class VoiceGlobeMapper {
     }
 
     private struct Original {
-        /// `nil` is meaningful here: F5 had no mapping before this launch.
-        let mapping: Mapping?
+        /// 应用前该服务的完整 UserKeyMapping 列表。restore 时整体写回。
+        let mappings: [Mapping]
     }
 
     /// The one F5 mapping that existed before this launch, keyed by service.
@@ -61,24 +83,27 @@ final class VoiceGlobeMapper {
         let services = IOHIDEventSystemClientCopyServices(client) as? [IOHIDServiceClient] ?? []
         var matched = 0
         var applied = 0
-        let destination: UInt64 = (mode == .leftControl) ? Self.leftControlUsage : Self.appleGlobeUsage
+        // 语音键目标：Globe 或 LeftControl（由模式决定）
+        let voiceDest: UInt64 = (mode == .leftControl) ? Self.leftControlUsage : Self.appleGlobeUsage
+        // 构建完整映射列表：所有按键 → No-Event，语音键 → Globe/LeftControl
+        var desiredMappings: [Mapping] = Self.neutralizedUsages.map {
+            Mapping(source: Self.keyboardUsage($0), destination: Self.noEventUsage)
+        }
+        desiredMappings.append(Mapping(source: Self.voiceF5Usage, destination: voiceDest))
 
         for service in services where isVoiceRemote(service) {
             matched += 1
             guard let id = registryID(service) else { continue }
             let current = readMappings(service)
-            // 仅在首次记录"应用前"的 F5 原始映射；切换模式重入时不清空它，保证退出时能恢复。
+            // 首次记录"应用前"的完整映射（restore 时整体写回）
             if originals[id] == nil {
-                originals[id] = Original(mapping: current.first { $0.source == Self.voiceF5Usage })
+                originals[id] = Original(mappings: current)
             }
-            // 先移除我们之前可能写入的目标（避免 Globe/LeftControl 残留），再写入当前模式目标。
-            let pruned = current.filter {
-                $0.source != Self.voiceF5Usage && $0.destination != destination
-            } + [Mapping(source: Self.voiceF5Usage, destination: destination)]
+            // 写入全键屏蔽映射（覆盖该服务的 UserKeyMapping）
             if IOHIDServiceClientSetProperty(
                 service,
                 Self.mappingProperty,
-                pruned.map { $0.property } as CFArray
+                desiredMappings.map { $0.property } as CFArray
             ) {
                 applied += 1
             }
@@ -93,12 +118,11 @@ final class VoiceGlobeMapper {
         let services = IOHIDEventSystemClientCopyServices(client) as? [IOHIDServiceClient] ?? []
         for service in services where isVoiceRemote(service) {
             guard let id = registryID(service), let original = originals[id] else { continue }
-            let current = readMappings(service).filter { $0.source != Self.voiceF5Usage }
-            let restored = original.mapping.map { current + [$0] } ?? current
+            // 把应用前的完整映射写回（恢复遥控器原始行为）
             _ = IOHIDServiceClientSetProperty(
                 service,
                 Self.mappingProperty,
-                restored.map { $0.property } as CFArray
+                original.mappings.map { $0.property } as CFArray
             )
         }
         originals.removeAll()

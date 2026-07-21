@@ -268,6 +268,8 @@ final class Engine: ObservableObject {
     }
     // Back 短脉冲过滤：<35ms 的孤立 down→up 视为抖动，不启动删除定时器。
     private var backDownAt: TimeInterval = 0
+    // value callback 状态机：当前 active 的 usage（用于 down/up 配对，学 mi-ao HIDButtonEventReducer）
+    private var activeValueUsage: Int = 0
     // 速率熔断：统计导航/编辑类键（Delete/方向/回车）的触发频率。
     // 2 秒内 ≥8 次判定设备异常（Pro 静置自发特征）。触发后持续拦截，
     // 直到连续 10 秒无导航键事件才恢复（自发噪声持续不断会被一直挡住，
@@ -1434,78 +1436,58 @@ final class Engine: ObservableObject {
     private func setupHID() {
         guard hidMgr == nil else { return }
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else { return }
-        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, 0)
-        // 小米多个蓝牙遥控器型号共用 VID 0x2717，但联想 XiaoxinM2Pro 等第三方语音遥控器用 VID 0x17EF。
-        // 用"已知 VID + 名称匹配"两套匹配字典，覆盖更广。
-        // 安全性由 handleHIDReport 保证：只处理含已知 usage 的报告，其它设备的报告一律放行。
-        var matches: [[String: Any]] = [
-            [kIOHIDVendorIDKey: 0x2717],   // 小米
-            [kIOHIDVendorIDKey: 0x17EF],   // 联想（XiaoxinM2Pro BT）
-        ]
-        let nameKeywords = ["遥控", "remote", "mitv", "mi tv", "xiaomi", "xiaoxin", "m2pro", "aibao", "语音"]
-        // 名称匹配：PrimaryUsage 0x07(Keyboard)/0x0C(Consumer) + 产品名命中关键字
-        for kw in nameKeywords {
-            matches.append([
-                kIOHIDProductKey: kw,
-                kIOHIDPrimaryUsagePageKey: 0x01,   // Generic Desktop（多数遥控器顶层描述符）
-            ])
-        }
-        IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
+        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        // 匹配已知遥控器厂商 VID（小米 0x2717 / 联想 0x17EF）。
+        // 用 IOHIDManagerRegisterInputValueCallback（元素值回调）而非 RegisterInputReportCallback，
+        // 因为 value callback 在内核 hidutil No-Event 映射【之前】拿到原始 usage——
+        // 这样内核屏蔽自发噪声到前台的同时，App 仍能读取按键做映射（变速删除/备忘录等）。
+        IOHIDManagerSetDeviceMatchingMultiple(mgr, [
+            [kIOHIDVendorIDKey: 0x2717],
+            [kIOHIDVendorIDKey: 0x17EF],
+        ] as CFArray)
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
-        let openRes = IOHIDManagerOpen(mgr, 0)
+        let openRes = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
         guard openRes == kIOReturnSuccess else {
             L("⚠️ IOHIDManagerOpen 失败: \(openRes)（输入监控权限未授权？）")
             return
         }
-        guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
-            L("⚠️ IOHID 未发现小米遥控器，稍后自动重试")
-            // 没找到设备时不持久化 hidMgr，让定时器可以重试
-            return
-        }
-        inputMonitoringOK = true
-        // 同一物理设备会暴露多个 HID 接口（键盘 + 消费控制），枚举时按 (VID,PID,名称) 去重，
-        // 并排除 Apple 内建键盘/触控板（VID 0x05AC）等非遥控器设备，避免日志刷屏和误注册回调。
-        var seen = Set<String>()
-        var remoteDevices: [IOHIDDevice] = []
-        for dvc in set {
-            let name = (IOHIDDeviceGetProperty(dvc, kIOHIDProductKey as CFString) as? String) ?? "?"
-            let vid = (IOHIDDeviceGetProperty(dvc, kIOHIDVendorIDKey as CFString) as? NSNumber)?.intValue ?? 0
-            let pid = (IOHIDDeviceGetProperty(dvc, kIOHIDProductIDKey as CFString) as? NSNumber)?.intValue ?? 0
-            // 只接受已知遥控器厂商（小米 0x2717 / 联想 0x17EF）且产品名命中遥控器关键字。
-            // 严格过滤掉 Apple 内建键盘/触控板（VID 0x05AC）和 VID=0 的通用 HID 设备，
-            // 避免把内建键盘当遥控器注册（曾导致"Apple Internal Keyboard"出现在设备列表）。
-            guard RemoteDeviceFilter.isEligible(vid: vid, pid: pid, product: name) else { continue }
-            let key = "\(vid):\(pid):\(name)"
-            if seen.contains(key) { continue }
-            seen.insert(key)
-            remoteDevices.append(dvc)
-            L("📱 HID 设备: \(Self.displayName(for: name)) (VID 0x\(String(format:"%04X",vid)) PID 0x\(String(format:"%04X",pid)))")
-        }
-        guard !remoteDevices.isEmpty else {
-            L("⚠️ IOHID 未发现遥控器（已排除内建键盘），稍后自动重试")
-            return
-        }
-        L("✅ HID 找到 \(remoteDevices.count) 个遥控设备")
-        for dvc in remoteDevices {
-            let rsize = (IOHIDDeviceGetProperty(dvc, kIOHIDMaxInputReportSizeKey as CFString) as? Int) ?? 64
-            _ = IOHIDDeviceOpen(dvc, IOHIDOptionsType(kIOHIDOptionsTypeNone))
-            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: max(rsize,8)); hidBufs.append(buf)
-            let ctx = Unmanaged.passUnretained(self).toOpaque()
-            IOHIDDeviceRegisterInputReportCallback(dvc, buf, max(rsize,8), { context, _, _, _, _, report, len in
-                guard let context = context, len > 0 else { return }
-                let me = Unmanaged<Engine>.fromOpaque(context).takeUnretainedValue()
-                let bytes = Array(UnsafeBufferPointer(start: report, count: Int(len)))
-                // HID 设备注册在 main runloop，回调必在 main 线程。用 assumeIsolated 同步处理，
-                // 保证抖动检测的时间窗准确（之前用 Task @MainActor 异步导致窗口打散、抖动检测失效，
-                // 拿起遥控器的脉冲没被拦住，疯狂触发删除）。
-                // assumeIsolated 在 main 线程是安全的；若极端情况不在 main，跳过本次（不崩）。
-                if Thread.isMainThread {
-                    MainActor.assumeIsolated { me.handleHIDReport(bytes) }
-                } else {
-                    DispatchQueue.main.async { Task { @MainActor in me.handleHIDReport(bytes) } }
+        // 注册 value 回调（Manager 级，对所有匹配设备生效）。
+        // 回调签名：(context, result, sender, value)。value 是 IOHIDValue。
+        // 在内核 hidutil No-Event 映射【之前】拿到原始 usage，不受屏蔽影响。
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        let valueCallback: IOHIDValueCallback = { context, result, _, value in
+            guard result == kIOReturnSuccess, let context else { return }
+            let me = Unmanaged<Engine>.fromOpaque(context).takeUnretainedValue()
+            let element = IOHIDValueGetElement(value)
+            let page = IOHIDElementGetUsagePage(element)
+            let usage = IOHIDElementGetUsage(element)
+            let rawValue = IOHIDValueGetIntegerValue(value)
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { me.handleHIDValue(page: page, usage: usage, rawValue: rawValue) }
+            } else {
+                DispatchQueue.main.async {
+                    Task { @MainActor in me.handleHIDValue(page: page, usage: usage, rawValue: rawValue) }
                 }
-            }, ctx)
-            IOHIDDeviceScheduleWithRunLoop(dvc, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+            }
+        }
+        IOHIDManagerRegisterInputValueCallback(mgr, valueCallback, ctx)
+        // 枚举设备用于日志
+        inputMonitoringOK = true
+        if let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty {
+            var seen = Set<String>()
+            var count = 0
+            for dvc in set {
+                let name = (IOHIDDeviceGetProperty(dvc, kIOHIDProductKey as CFString) as? String) ?? "?"
+                let vid = (IOHIDDeviceGetProperty(dvc, kIOHIDVendorIDKey as CFString) as? NSNumber)?.intValue ?? 0
+                let pid = (IOHIDDeviceGetProperty(dvc, kIOHIDProductIDKey as CFString) as? NSNumber)?.intValue ?? 0
+                guard RemoteDeviceFilter.isEligible(vid: vid, pid: pid, product: name) else { continue }
+                let key = "\(vid):\(pid):\(name)"
+                if seen.contains(key) { continue }
+                seen.insert(key)
+                count += 1
+                L("📱 HID 设备: \(Self.displayName(for: name)) (VID 0x\(String(format:"%04X",vid)) PID 0x\(String(format:"%04X",pid)))")
+            }
+            L("✅ HID 监听 \(count) 个遥控设备（value callback，内核屏蔽后仍可读）")
         }
         hidMgr = mgr
         if hidMgr != nil { flashKey(label: "✓ 遥控器就绪", mapping: "可以开始按键") }
@@ -1529,6 +1511,33 @@ final class Engine: ObservableObject {
 
     /// Xiaomi remotes expose both compact and keyboard-array report layouts.
     /// Normalize either form before dispatching a button action.
+    /// IOHIDValue 回调处理（内核 hidutil 映射前读取，不受 No-Event 屏蔽影响）。
+    /// 每个 HID 元素值变化触发一次，做 down/up 配对后调用 hidReport(usage:) 复用全部映射逻辑。
+    private func handleHIDValue(page: UInt32, usage: UInt32, rawValue: Int) {
+        // 只处理 Keyboard page (0x07) 的已知按键 usage
+        guard page == 0x07 else { return }
+        let u = Int(usage)
+        let knownUsages: Set<Int> = [0x52, 0x51, 0x50, 0x4F, 0x28, 0xF1, 0x4A, 0x35, 0x65, 0x66, 0x3E, 0x80, 0x81]
+        guard knownUsages.contains(u) else { return }
+
+        if rawValue != 0 {
+            // 新键按下：若之前有别的键 active，先发 release
+            if activeValueUsage != 0 && activeValueUsage != u {
+                hidReport(usage: 0)
+            }
+            // 同键重复（自动重复）→ 忽略
+            if activeValueUsage == u { return }
+            activeValueUsage = u
+            hidReport(usage: UInt8(u))
+        } else {
+            // release（rawValue==0）
+            if activeValueUsage == u {
+                hidReport(usage: 0)
+                activeValueUsage = 0
+            }
+        }
+    }
+
     private func handleHIDReport(_ bytes: [UInt8]) {
         // 诊断模式：记录所有 HID 报告原始字节（含被过滤的圆盘/圆环），用于排查"静置自发误触"。
         // 通过 hidDiagMode 开关控制，避免正常使用时刷屏。标注报告格式便于区分真实按压 vs 自发噪声。
@@ -1595,13 +1604,13 @@ final class Engine: ObservableObject {
             if voiceHidDown { voiceHidDown = false; lastHidKeycodeAt[HIDMap.voiceKeycode] = now }
             if let t = downTarget {
                 if t.usage == 0xF1 && t.keycode == 0x33 {
-                    // Back 脉冲时长诊断：<35ms 视为抖动脉冲（本就不该删，记录便于排查）。
+                    // Back（删除键）脉冲时长诊断：<35ms 视为抖动脉冲。
                     // 删除定时器已在上面 invalidate，短脉冲不会触发删除。
                     let pulseMs = Int((now - backDownAt) * 1000)
                     if pulseMs < 35 {
-                        L("Back 短脉冲 \(pulseMs)ms，视为抖动忽略")
+                        L("Back(删除) 短脉冲 \(pulseMs)ms，视为抖动忽略")
                     } else {
-                        L("Back 松开（按下 \(pulseMs)ms）")
+                        L("Back(删除) 松开（按下 \(pulseMs)ms）")
                     }
                 } else if t.longPressKeycode != nil {
                     if !longPressFired { tapMapping(t) }
@@ -1639,7 +1648,7 @@ final class Engine: ObservableObject {
         if now < bounceSuppressUntil {
             return
         }
-        // 额外保护：Back 的删除定时器若在等待中（0.4s 内）收到别的按键，立即取消
+        // 额外保护：Back(删除) 的定时器若在等待中（0.4s 内）收到别的按键，立即取消
         // （真实长按 Back 不会夹杂其他按键）。
         if downButtonUsage == 0xF1 && Int(usage) != 0xF1 {
             deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
@@ -1666,13 +1675,12 @@ final class Engine: ObservableObject {
             return
         }
         if m.keycode == KeyNames.kNone { downButtonUsage = Int(usage); downTarget = nil; return }
-        if Int(usage) == 0xF1 && m.keycode == 0x33 {
-            // Back 改为「仅长按删除」：单击不删除（避免拿起遥控器/手指抖动误触），
-            // 按住 ≥400ms 才开始连续删除。记录按下时间，release 时检查脉冲时长：
-            // <35ms 的孤立短脉冲视为抖动，立即取消（不等到 0.4s 定时器触发）。
+        if Int(usage) == 0x28 && m.keycode == 0x33 {
+            // OK 改为「仅长按删除」：单击不删除（避免拿起遥控器/手指抖动误触），
+            // 按住 ≥400ms 才开始连续删除。OK 自发 0 次（最稳），适合承担删除。
             backDownAt = now
             downButtonUsage = Int(usage); downTarget = m
-            L("Back 已按下，按住 0.4 秒后开始删除…")
+            L("OK(删除) 已按下，按住 0.4 秒后开始删除…")
             startDeleteRepeat()
             return
         }
@@ -1742,7 +1750,7 @@ final class Engine: ObservableObject {
         // 首延迟 0.4s：配合"仅长按删除"——拿起抖动脉冲通常 <300ms，400ms 足以过滤；
         // 真实长按 0.4s 后才开始删，响应仍够快。
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self = self, self.downButtonUsage == 0xF1 else { return }
+            guard let self = self, self.downButtonUsage == 0x28 else { return }
             // 动态间隔：用可变状态而非闭包常量，每删一次就收缩一次
             var interval: Float = 0.12        // 起始 0.12s（~8 次/秒，慢，能看清一个个删）
             let minInterval: Float = 0.022    // 收尾 0.022s（~45 次/秒，飞快）
@@ -1750,7 +1758,7 @@ final class Engine: ObservableObject {
             self.lastDeleteRepeatAt = ProcessInfo.processInfo.systemUptime
             self.deleteRepeatTimer = Timer.scheduledTimer(withTimeInterval: 0.005, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    guard let self = self, self.downButtonUsage == 0xF1 else { return }
+                    guard let self = self, self.downButtonUsage == 0x28 else { return }
                     let now = ProcessInfo.processInfo.systemUptime
                     guard now - self.lastDeleteRepeatAt >= TimeInterval(interval) else { return }
                     self.lastDeleteRepeatAt = now
@@ -1804,8 +1812,8 @@ final class Engine: ObservableObject {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
     }
-    // 导航/编辑类键码集合：用于速率熔断统计。
-    // 这些是遥控器自发误触的主角（Delete/方向/回车/空格/Esc），Mac 键盘连续高频敲它们很少见。
+    // 导航/编辑类键码集合：用于速率熔断统计（Delete/方向/回车/空格/Esc）。
+    // 这些是遥控器自发误触的主角，Mac 键盘连续高频敲它们很少见。
     private static let navKeycodes: Set<CGKeyCode> = [
         0x33,       // Delete / Backspace
         0x7E, 0x7D, 0x7B, 0x7C,  // 方向 上/下/左/右
@@ -1813,27 +1821,35 @@ final class Engine: ObservableObject {
         0x31,       // Space
         0x35,       // Esc
     ]
+    // 休眠态/全局暂停 可拦截的键（只含方向键 + Esc）。
+    // Delete/Return/Space 绝对不拦——它们是 Mac 键盘高频刚需键，拦了会废掉打字。
+    // 遥控器 Delete/Return 自发的防护交给：40ms 短脉冲过滤 + 速率熔断（不靠休眠态全拦）。
+    private static let suppressibleNavKeycodes: Set<CGKeyCode> = [
+        0x7E, 0x7D, 0x7B, 0x7C,  // 方向 上/下/左/右
+        0x35,       // Esc
+    ]
     // called from tap thread — keep it cheap & thread-safe-ish (dictionary read)
     nonisolated func shouldSuppress(_ kc: CGKeyCode) -> Bool {
         // 注意：此函数从 CGEvent tap 线程高频调用，绝不能在里面打日志或做重活，
         // 否则会拖慢整个事件流（曾因每次都 L() 导致主线程繁忙、语音卡顿、Back 删除时序错乱）。
+        //
+        // 核心原则：Mac 键盘永远好用。App 是"键盘之外的附加"，防误触只靠 TV 唤醒状态机，
+        // 绝不无差别吞 Mac 键盘的键（曾因速率熔断/全集拦截误伤 Mac 的 Delete/回车）。
+        // Mac 刚需键（Delete/Return/Space）任何情况下都不拦——即便休眠态也不拦，
+        // 因为 CGEvent tap 分不清事件来自 Mac 键盘还是遥控器，宁可放过不可误伤。
         var suppress = false
         MainActor.assumeIsolated {
             let now = ProcessInfo.processInfo.systemUptime
-            // 设备层映射生效后（hardwareGlobeReady==true），F5 已被重映射成 Globe/LeftControl，
-            // 这时放行是【正常】的。仅在"映射未就绪且 F5 漏过来"时才吞掉，防止触发 macOS 原生听写。
+            // F5（语音键）：仅在 HID 重映射未就绪时吞掉，防止触发 macOS 原生听写
             if kc == HIDMap.voiceKeycode {
                 suppress = !hardwareGlobeReady && (voiceHidDown || (lastHidKeycodeAt[kc].map { now - $0 < 0.12 } ?? false))
                 return
             }
-            // ① 全局暂停：开启时拦截所有导航/编辑类键（用户离开时一键开启）
-            if remotePaused && Self.navKeycodes.contains(kc) {
-                suppress = true
-                return
-            }
-            // ② 休眠态（TV 唤醒状态机）：休眠时拦截所有导航键，只有 TV 键能唤醒（TV 唤醒走
-            // IOHIDManager usage 0x35，不经过 tap）。唤醒期内放行并续期。
-            if tvWakeEnabled && !remoteAwake && Self.navKeycodes.contains(kc) {
+            // Mac 刚需键（Delete/回车/空格）任何情况下都不拦——分不清来源，宁可放过
+            if kc == 0x33 || kc == 0x24 || kc == 0x31 { return }
+            // ① 全局暂停 / ② 休眠态：只拦方向键 + Esc（Mac 键盘这些键用得少，且 TV 模式下
+            // 用户预期方向键被锁）。Delete/回车/空格已在上面放行。
+            if (remotePaused || (tvWakeEnabled && !remoteAwake)) && Self.suppressibleNavKeycodes.contains(kc) {
                 suppress = true
                 return
             }
@@ -1841,39 +1857,8 @@ final class Engine: ObservableObject {
             if tvWakeEnabled && remoteAwake && Self.navKeycodes.contains(kc) {
                 awakeUntil = now + awakeTimeout
             }
-            // ② 速率熔断（持续拦截直到静默）：导航/编辑类键在 2 秒内 ≥8 次，
-            // 判定设备异常（Pro 静置自发特征）。触发后持续拦截，直到连续 10 秒
-            // 无导航键事件才解除（自发噪声持续不断会被一直挡住）。
-            if Self.navKeycodes.contains(kc) {
-                navKeyTimestamps = navKeyTimestamps.filter { now - $0 < 2.0 }
-                navKeyTimestamps.append(now)
-                if !circuitBreakerActive && navKeyTimestamps.count >= 8 {
-                    circuitBreakerActive = true
-                    let count = navKeyTimestamps.count
-                    Task { @MainActor in self.L("🛑 速率熔断：2秒内 \(count) 次导航键，持续拦截直到静默 10 秒") }
-                }
-                if circuitBreakerActive {
-                    // 距上次导航键事件超过 10 秒才视为静默，解除熔断；否则继续拦截
-                    if now - lastNavKeyAt > 10.0 {
-                        circuitBreakerActive = false
-                        navKeyTimestamps.removeAll()
-                        Task { @MainActor in self.L("✅ 熔断解除：已静默 10 秒，恢复按键处理") }
-                    } else {
-                        lastNavKeyAt = now   // 更新最近事件时间，持续 spam 就一直挡
-                        suppress = true
-                        return
-                    }
-                }
-                lastNavKeyAt = now
-            }
-            // ③ 原有逻辑：遥控器 HID 通道产生的按键在 120ms 内被映射，吞掉避免双触发
-            if let ts = lastHidKeycodeAt[kc], now - ts < 0.12 {
-                if let usage = HIDMap.usageToKeycode.first(where: { $0.value == kc })?.key,
-                   let m = config.buttons.first(where: { $0.usage == Int(usage) }),
-                   m.keycode != KeyNames.kNone {
-                    suppress = true
-                }
-            }
+            // 内核 hidutil No-Event 屏蔽已吞掉遥控器原始事件，系统不会双触发，
+            // 不需要原来的 120ms 时间窗拦截。shouldSuppress 现在只处理 F5 和休眠态。
         }
         return suppress
     }
