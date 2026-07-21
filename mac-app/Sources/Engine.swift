@@ -236,6 +236,8 @@ final class Engine: ObservableObject {
     private var lastVoicePacketAt: TimeInterval = 0
     private var voiceSessionStartAt: TimeInterval = 0   // 本次语音键按下的起始时间，用于丢包统计
     private var systemSuspended = false
+    // 用户主动断开标志：为 true 时 didDisconnect 不自动重连。selectRemote/retryScan/恢复时复位。
+    private var userDisconnected = false
     private var reconnectGeneration = 0
     private var lastRecoveryAt: TimeInterval = 0
     private var workspaceObservers: [NSObjectProtocol] = []
@@ -250,6 +252,10 @@ final class Engine: ObservableObject {
     @Published var ringLearningMode = false
     private var ringLearningBuffer: [(bytes: [UInt8], at: TimeInterval)] = []
     private var ringLearnStartAt: TimeInterval = 0
+    // 圆盘校准滚动解码器：3 帧稳定同方向才发有界滚动，静置/不稳噪声自动过滤。
+    private var ringDecoder = RingScrollDecoder()
+    // Back 短脉冲过滤：<35ms 的孤立 down→up 视为抖动，不启动删除定时器。
+    private var backDownAt: TimeInterval = 0
     // 抖动检测：拿起遥控器/手指碰圆环时会产生密集且多变的 usage 切换（0xF1/0x28/0x51 混跳），
     // 真实按键是单一 usage 持续保持。记录近期（200ms 内）出现的不同 usage 集合，
     // 若短时间内切换 ≥3 种不同 usage，判定为抖动，忽略这批脉冲，避免误删除。
@@ -289,9 +295,16 @@ final class Engine: ObservableObject {
     }()
     func L(_ s: String) {
         NSLog("[小米超级键盘] %@", s)
-        Engine.logFile?.write((s + "\n").data(using: .utf8)!)
+        // 持久日志加 ISO8601 时间戳（含毫秒），便于关联圆盘帧/修饰键状态/滤波判定
+        let ts = Self.isoFormatter.string(from: Date())
+        Engine.logFile?.write("\(ts)  \(s)\n".data(using: .utf8)!)
         log.append(s); if log.count > 200 { log.removeFirst(log.count - 200) }
     }
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
 
     // ---------- lifecycle ----------
     private var started = false
@@ -1041,6 +1054,7 @@ final class Engine: ObservableObject {
     /// 手动切换当前遥控器（UI 调用）。
     func selectRemote(_ id: UUID) {
         guard selectedRemoteID != id || dev?.identifier != id else { return }
+        userDisconnected = false   // 切换设备视为主动操作，清除断开标志
         selectedRemoteID = id
         // 持久化选择：系统配对设备的 identifier 跨重启稳定，下次启动自动回连同一台
         UserDefaults.standard.set(id.uuidString, forKey: "selectedRemoteID")
@@ -1068,11 +1082,29 @@ final class Engine: ObservableObject {
     }
     func retryScan() {
         // 手动重新扫描：清候选后重新发现，保留 selectedRemoteID 以便回连原选择
+        userDisconnected = false
         discoveredRemotes.removeAll(); discoveredPeripherals.removeAll()
         if let cur = dev { cm?.cancelPeripheralConnection(cur) }
         dev = nil; tx = nil; capsSent = false
         remoteConnected = false; handshakeReady = false; streaming = false; micStreaming = false
         recoverAfterSessionChange(reason: "手动重新连接")
+    }
+    /// 菜单栏「连接设备」：连回当前选中的遥控器（清除用户断开标志）。
+    func connectSelectedRemote() {
+        userDisconnected = false
+        L("📎 用户请求连接设备")
+        connectSelectedIfNeeded()
+    }
+    /// 菜单栏「断开设备」：断开当前遥控器，且不自动重连（直到用户主动连接）。
+    func disconnectCurrentRemote() {
+        userDisconnected = true
+        streaming = false; micStreaming = false
+        if let cur = dev { cm?.cancelPeripheralConnection(cur) }
+        dev = nil; tx = nil; capsSent = false
+        remoteConnected = false; handshakeReady = false
+        if let i = discoveredRemotes.firstIndex(where: { $0.connected }) { discoveredRemotes[i].connected = false }
+        recoverStuckModifiers()
+        L("✂️ 用户请求断开设备，不再自动重连")
     }
     fileprivate func didDiscover(_ p: CBPeripheral, rssi: Int) {
         // 加入候选列表（addCandidate 内部按 id/名称去重），扫描继续让用户能看到所有设备。
@@ -1087,12 +1119,38 @@ final class Engine: ObservableObject {
     fileprivate func didConnect(_ p: CBPeripheral) { remoteConnected = true; p.discoverServices([ATVV]) }
     fileprivate func didDisconnect() {
         remoteConnected = false; handshakeReady = false; streaming = false
-        guard !systemSuspended else { return }
+        // 修饰键卡死恢复：BLE 断开后检查系统修饰键状态，若 Command/Shift/Control/Option
+        // 仍被标记按下，发合成 key-up 复位（满足验收标准：断开后 USB 键盘状态全零）。
+        recoverStuckModifiers()
+        // 用户主动断开时不自动重连；系统睡眠也不重连
+        guard !systemSuspended, !userDisconnected else { return }
         // 自动重连：先看是否系统配对，再扫描
         let generation = reconnectGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            guard let self, self.reconnectGeneration == generation, !self.systemSuspended else { return }
+            guard let self, self.reconnectGeneration == generation,
+                  !self.systemSuspended, !self.userDisconnected else { return }
             self.startSearching()
+        }
+    }
+    /// 检查系统修饰键状态，若遥控器遗留了"按下未松开"，发 key-up 复位。
+    private func recoverStuckModifiers() {
+        let flags = CGEventSource.flagsState(.combinedSessionState)
+        var recovered: [String] = []
+        // 修饰键 keycode：左⌘=0x37 右⌘=0x36 左⇧=0x38 右⇧=0x3C 左⌥=0x3A 右⌥=0x3D 左⌃=0x3B 右⌃=0x3E
+        if flags.contains(.maskCommand) {
+            postKey(0x37, down: false, cmd: false); postKey(0x36, down: false, cmd: false); recovered.append("⌘")
+        }
+        if flags.contains(.maskShift) {
+            postKey(0x38, down: false, cmd: false); postKey(0x3C, down: false, cmd: false); recovered.append("⇧")
+        }
+        if flags.contains(.maskAlternate) {
+            postKey(0x3A, down: false, cmd: false); postKey(0x3D, down: false, cmd: false); recovered.append("⌥")
+        }
+        if flags.contains(.maskControl) {
+            postKey(0x3B, down: false, cmd: false); postKey(0x3E, down: false, cmd: false); recovered.append("⌃")
+        }
+        if !recovered.isEmpty {
+            L("🔧 BLE 断开后复位卡死修饰键：\(recovered.joined(separator: " "))")
         }
     }
     fileprivate func didServices(_ p: CBPeripheral) {
@@ -1251,8 +1309,10 @@ final class Engine: ObservableObject {
             let name = (IOHIDDeviceGetProperty(dvc, kIOHIDProductKey as CFString) as? String) ?? "?"
             let vid = (IOHIDDeviceGetProperty(dvc, kIOHIDVendorIDKey as CFString) as? NSNumber)?.intValue ?? 0
             let pid = (IOHIDDeviceGetProperty(dvc, kIOHIDProductIDKey as CFString) as? NSNumber)?.intValue ?? 0
-            // 排除 Apple 内建设备（键盘/触控板），它们不是遥控器
-            if vid == 0x05AC { continue }
+            // 只接受已知遥控器厂商（小米 0x2717 / 联想 0x17EF）且产品名命中遥控器关键字。
+            // 严格过滤掉 Apple 内建键盘/触控板（VID 0x05AC）和 VID=0 的通用 HID 设备，
+            // 避免把内建键盘当遥控器注册（曾导致"Apple Internal Keyboard"出现在设备列表）。
+            guard RemoteDeviceFilter.isEligible(vid: vid, pid: pid, product: name) else { continue }
             let key = "\(vid):\(pid):\(name)"
             if seen.contains(key) { continue }
             seen.insert(key)
@@ -1318,11 +1378,20 @@ final class Engine: ObservableObject {
             hidReport(usage: 0)
             return
         }
-        // Pro 圆盘（类 AirPods 滚轮）转动会发 ReportID=0x03 的 7 字节报告，含鼠标位移 + 滚轮。
-        // 调研结论：从 /Applications 启动时报告能收到，但 macOS 事件系统行为不稳定
-        // （build 目录启动被系统拦截），且方向编码全是正值无负值、规律未明。
-        // 保持静默，不转发（避免页面"锁到滚动"），不刷屏日志。
+        // Pro 圆盘（类 AirPods 滚轮）转动会发 ReportID=0x03 的 7 字节报告。
+        // 接 RingScrollDecoder：连续 ≥3 帧、间隔 ≤80ms、同一字节位同方向，才发有界滚动；
+        // 否则视为静置/不稳噪声，忽略。校准失败时保持静默（安全优先）。
         if bytes.count == 7 && bytes[0] == 0x03 {
+            let now = ProcessInfo.processInfo.systemUptime
+            let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+            if let evt = ringDecoder.consume(bytes, at: now) {
+                postScroll(evt.lines)
+                L("🖲圆盘滚动: \(hex) → \(evt.lines) 行")
+            } else if ringLearningMode {
+                // 学习模式额外记录原始字节供分析（非学习模式不刷屏）
+                ringLearningBuffer.append((bytes: bytes, at: now))
+                L("🗃圆盘帧: \(hex)（未达稳定阈值，忽略）")
+            }
             return
         }
         // Pro 圆环转动会发密集的键盘数组报告（ReportID=0x01，10 字节，主键 [3] 是字母/数字
@@ -1345,8 +1414,14 @@ final class Engine: ObservableObject {
             if voiceHidDown { voiceHidDown = false; lastHidKeycodeAt[HIDMap.voiceKeycode] = now }
             if let t = downTarget {
                 if t.usage == 0xF1 && t.keycode == 0x33 {
-                    // Backspace is emitted as complete taps, never as a held key.
-                    // This prevents macOS's own repeat curve from fighting ours.
+                    // Back 脉冲时长诊断：<35ms 视为抖动脉冲（本就不该删，记录便于排查）。
+                    // 删除定时器已在上面 invalidate，短脉冲不会触发删除。
+                    let pulseMs = Int((now - backDownAt) * 1000)
+                    if pulseMs < 35 {
+                        L("Back 短脉冲 \(pulseMs)ms，视为抖动忽略")
+                    } else {
+                        L("Back 松开（按下 \(pulseMs)ms）")
+                    }
                 } else if t.longPressKeycode != nil {
                     if !longPressFired { tapMapping(t) }
                 } else if t.keycode >= KeyNames.kSpecialBase { stopSpecial(t.keycode) }
@@ -1405,7 +1480,9 @@ final class Engine: ObservableObject {
         if m.keycode == KeyNames.kNone { downButtonUsage = Int(usage); downTarget = nil; return }
         if Int(usage) == 0xF1 && m.keycode == 0x33 {
             // Back 改为「仅长按删除」：单击不删除（避免拿起遥控器/手指抖动误触），
-            // 按住 ≥400ms 才开始连续删除。拿起的短脉冲不会持续 400ms，天然被过滤。
+            // 按住 ≥400ms 才开始连续删除。记录按下时间，release 时检查脉冲时长：
+            // <35ms 的孤立短脉冲视为抖动，立即取消（不等到 0.4s 定时器触发）。
+            backDownAt = now
             downButtonUsage = Int(usage); downTarget = m
             L("Back 已按下，按住 0.4 秒后开始删除…")
             startDeleteRepeat()

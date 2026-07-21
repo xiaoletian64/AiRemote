@@ -49,10 +49,10 @@ echo "Building ${APP_NAME} ${VER}"
 if [ "$UNIVERSAL" = "1" ]; then
     echo "→ 通用二进制（arm64 + x86_64）"
     swiftc -O -target arm64-apple-macos13.0 -module-name "${EXEC_NAME}" \
-      Sources/Model.swift Sources/VoiceGlobeMapper.swift Sources/Engine.swift Sources/UI.swift Sources/main.swift \
+      Sources/Model.swift Sources/VoiceGlobeMapper.swift Sources/RemoteInputSafety.swift Sources/Engine.swift Sources/UI.swift Sources/main.swift \
       -o "$APP/Contents/MacOS/${EXEC_NAME}.arm64"
     swiftc -O -target x86_64-apple-macos13.0 -module-name "${EXEC_NAME}" \
-      Sources/Model.swift Sources/VoiceGlobeMapper.swift Sources/Engine.swift Sources/UI.swift Sources/main.swift \
+      Sources/Model.swift Sources/VoiceGlobeMapper.swift Sources/RemoteInputSafety.swift Sources/Engine.swift Sources/UI.swift Sources/main.swift \
       -o "$APP/Contents/MacOS/${EXEC_NAME}.x86_64"
     lipo -create "$APP/Contents/MacOS/${EXEC_NAME}.arm64" "$APP/Contents/MacOS/${EXEC_NAME}.x86_64" \
       -output "$APP/Contents/MacOS/${EXEC_NAME}"
@@ -61,7 +61,7 @@ else
     ARCH=$(uname -m)
     echo "→ 单架构：${ARCH}"
     swiftc -O -target "${ARCH}-apple-macos13.0" -module-name "${EXEC_NAME}" \
-      Sources/Model.swift Sources/VoiceGlobeMapper.swift Sources/Engine.swift Sources/UI.swift Sources/main.swift \
+      Sources/Model.swift Sources/VoiceGlobeMapper.swift Sources/RemoteInputSafety.swift Sources/Engine.swift Sources/UI.swift Sources/main.swift \
       -o "$APP/Contents/MacOS/${EXEC_NAME}"
 fi
 
