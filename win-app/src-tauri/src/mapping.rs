@@ -129,23 +129,44 @@ impl KeyMapper {
         let mut enigo = self.enigo.lock().unwrap();
         match mode {
             VoiceMode::WinH => {
-                // Win+H：Windows 语音听写（按下触发，松开不操作）
+                // Win+H：Windows 语音听写（单次触发，松开不操作）
                 let _ = enigo.key_down(Key::Super);
                 let _ = enigo.key_down(Key::Raw(vk::letter('h')));
                 let _ = enigo.key_up(Key::Raw(vk::letter('h')));
                 let _ = enigo.key_up(Key::Super);
             }
             VoiceMode::LeftCtrl => {
-                // 左 Ctrl 按住（松开时发 key-up）
+                // 左 Ctrl 按住
                 let _ = enigo.key_down(Key::Control);
             }
             VoiceMode::LeftWin => {
                 // 左 Win 按住
                 let _ = enigo.key_down(Key::Super);
             }
+            VoiceMode::CtrlWin => {
+                // Ctrl+Win 双修饰键同时按住
+                let _ = enigo.key_down(Key::Control);
+                let _ = enigo.key_down(Key::Super);
+            }
+            VoiceMode::WinShift => {
+                // Win+Shift 双修饰键同时按住
+                let _ = enigo.key_down(Key::Super);
+                let _ = enigo.key_down(Key::Shift);
+            }
+            VoiceMode::CtrlShift => {
+                // Ctrl+Shift 双修饰键同时按住
+                let _ = enigo.key_down(Key::Control);
+                let _ = enigo.key_down(Key::Shift);
+            }
+            VoiceMode::AltShift => {
+                // Alt+Shift：单次触发，切换输入语言（Windows 中英文切换）
+                let _ = enigo.key_down(Key::Alt);
+                let _ = enigo.key_down(Key::Shift);
+                let _ = enigo.key_up(Key::Shift);
+                let _ = enigo.key_up(Key::Alt);
+            }
             VoiceMode::MicToggle => {
-                // 切换虚拟麦克风转发开关（由 audio 模块处理，这里只触发事件）
-                // 实际音频转发逻辑在 ble.rs 的 ATVV 语音流处理中
+                // 切换虚拟麦克风转发开关（由 audio 模块处理）
             }
         }
     }
@@ -155,9 +176,26 @@ impl KeyMapper {
         use config::VoiceMode;
         let mut enigo = self.enigo.lock().unwrap();
         match mode {
-            VoiceMode::LeftCtrl => { let _ = enigo.key_up(Key::Control); }
-            VoiceMode::LeftWin => { let _ = enigo.key_up(Key::Super); }
-            _ => {}  // WinH 是单次触发，MicToggle 是开关，松开不操作
+            VoiceMode::LeftCtrl => {
+                let _ = enigo.key_up(Key::Control);
+            }
+            VoiceMode::LeftWin => {
+                let _ = enigo.key_up(Key::Super);
+            }
+            VoiceMode::CtrlWin => {
+                let _ = enigo.key_up(Key::Super);
+                let _ = enigo.key_up(Key::Control);
+            }
+            VoiceMode::WinShift => {
+                let _ = enigo.key_up(Key::Shift);
+                let _ = enigo.key_up(Key::Super);
+            }
+            VoiceMode::CtrlShift => {
+                let _ = enigo.key_up(Key::Shift);
+                let _ = enigo.key_up(Key::Control);
+            }
+            // WinH 是单次触发，AltShift 是单次触发，MicToggle 是开关——松开不操作
+            _ => {}
         }
     }
 

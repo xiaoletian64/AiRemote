@@ -101,6 +101,10 @@ pub enum VoiceMode {
     WinH,       // Win+H Windows 语音听写
     LeftCtrl,   // 左 Ctrl 修饰键
     LeftWin,    // 左 Win 键
+    CtrlWin,    // Ctrl+Win 组合修饰键
+    WinShift,   // Win+Shift 组合修饰键
+    CtrlShift,  // Ctrl+Shift 组合修饰键
+    AltShift,   // Alt+Shift 组合修饰键（中英文切换）
     MicToggle,  // 切换虚拟麦克风转发
 }
 
@@ -114,6 +118,10 @@ impl VoiceMode {
             VoiceMode::WinH => "Win+H 语音听写（推荐）",
             VoiceMode::LeftCtrl => "左 Ctrl（修饰键）",
             VoiceMode::LeftWin => "左 Win 键",
+            VoiceMode::CtrlWin => "Ctrl+Win（双修饰键）",
+            VoiceMode::WinShift => "Win+Shift（双修饰键）",
+            VoiceMode::CtrlShift => "Ctrl+Shift（双修饰键）",
+            VoiceMode::AltShift => "Alt+Shift（中英切换）",
             VoiceMode::MicToggle => "麦克风开关（转发音频）",
         }
     }
@@ -122,11 +130,24 @@ impl VoiceMode {
             VoiceMode::WinH => "触发 Windows 11/10 自带语音听写，最接近 Mac 的 Fn 听写",
             VoiceMode::LeftCtrl => "作为左 Ctrl 修饰键，配合其他键发 Ctrl 组合快捷键",
             VoiceMode::LeftWin => "作为左 Win 键，触发开始菜单/Windows 语音助手",
+            VoiceMode::CtrlWin => "同时按住 Ctrl+Win，配合其他键发 Win+Ctrl 组合",
+            VoiceMode::WinShift => "同时按住 Win+Shift，配合其他键发 Win+Shift 组合",
+            VoiceMode::CtrlShift => "同时按住 Ctrl+Shift，配合其他键发 Ctrl+Shift 组合",
+            VoiceMode::AltShift => "按一下切换输入语言（Windows 中英文切换快捷键）",
             VoiceMode::MicToggle => "按一下开始转发音频到虚拟麦克风，再按一下停止",
         }
     }
     pub fn all() -> &'static [VoiceMode] {
-        &[VoiceMode::WinH, VoiceMode::LeftCtrl, VoiceMode::LeftWin, VoiceMode::MicToggle]
+        &[
+            VoiceMode::WinH,
+            VoiceMode::LeftCtrl,
+            VoiceMode::LeftWin,
+            VoiceMode::CtrlWin,
+            VoiceMode::WinShift,
+            VoiceMode::CtrlShift,
+            VoiceMode::AltShift,
+            VoiceMode::MicToggle,
+        ]
     }
 }
 
