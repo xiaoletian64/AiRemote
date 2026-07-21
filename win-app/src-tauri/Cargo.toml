@@ -1,0 +1,46 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "小米超级键盘 - 小米蓝牙遥控器 Windows 版"
+authors = ["xiaoletian64"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3" }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3" }
+tauri-plugin-log = "2"
+# HID 设备读取（遥控器按键报告）
+hidapi = "2.6"
+# 键盘/鼠标事件合成（Windows SendInput）
+enigo = "0.2"
+# BLE 蓝牙（ATVV 语音服务）
+btleplug = "0.11"
+# 音频输出（到 VB-Cable 虚拟声卡）
+cpal = "0.15"
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+# 时间
+chrono = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# Windows API（锁屏/关机等特殊动作）
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
