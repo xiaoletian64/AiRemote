@@ -437,6 +437,18 @@ struct ContentView: View {
                     }
                 }
 
+                GroupBox("Pro 圆盘") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("启用圆盘滚动（默认关闭，防误触）", isOn: Binding(
+                            get: { e.ringEnabled },
+                            set: { e.setRingEnabled($0) }
+                        ))
+                        .toggleStyle(.switch)
+                        Text("开启后，Pro 圆盘转动会快速滚动页面（3 帧稳定同方向才触发）。默认关闭——圆盘容易误触，按需开启。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
                 GroupBox("应用") {
                     VStack(alignment: .leading, spacing: 10) {
                         Toggle("登录时自动启动", isOn: Binding(get: { e.launchAtLogin }, set: e.setLaunchAtLogin))

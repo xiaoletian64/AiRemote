@@ -254,8 +254,39 @@ final class Engine: ObservableObject {
     private var ringLearnStartAt: TimeInterval = 0
     // 圆盘校准滚动解码器：3 帧稳定同方向才发有界滚动，静置/不稳噪声自动过滤。
     private var ringDecoder = RingScrollDecoder()
+    // 圆盘开关：默认关闭（防误触）。用户在 UI 开启后才解码滚动事件。
+    @Published var ringEnabled: Bool = UserDefaults.standard.bool(forKey: "ringEnabled")
+    // HID 诊断模式：开启时记录所有报告原始字节，排查"静置自发误触"。默认开启用于本次诊断。
+    @Published var hidDiagMode: Bool = true
+    func setHidDiagMode(_ on: Bool) { hidDiagMode = on; L(on ? "🔬 HID 诊断已开启" : "HID 诊断已关闭") }
+    func setRingEnabled(_ on: Bool) {
+        guard ringEnabled != on else { return }
+        ringEnabled = on
+        UserDefaults.standard.set(on, forKey: "ringEnabled")
+        if !on { ringDecoder.reset() }   // 关闭时清了解码器状态，避免下次开启残留
+        L(on ? "🖲 圆盘滚动已开启" : "🖲 圆盘滚动已关闭（默认）")
+    }
     // Back 短脉冲过滤：<35ms 的孤立 down→up 视为抖动，不启动删除定时器。
     private var backDownAt: TimeInterval = 0
+    // 速率熔断：统计导航/编辑类键（Delete/方向/回车）的触发频率。
+    // 2 秒内 ≥8 次判定设备异常（Pro 静置自发特征）。触发后持续拦截，
+    // 直到连续 10 秒无导航键事件才恢复（自发噪声持续不断会被一直挡住，
+    // 用户回来正常低频按键，静默 10 秒后自动解除）。
+    // 只统计这些键，避免误伤 Mac 键盘正常打字（字母键不计数）。
+    private var navKeyTimestamps: [TimeInterval] = []
+    private var circuitBreakerActive = false           // 是否处于熔断态
+    private var lastNavKeyAt: TimeInterval = 0         // 最近一次导航键事件时间（熔断静默判断用）
+    // 全局暂停开关：开启时 tap 拦截所有导航/编辑类键（菜单栏一键，离开时用）。
+    @Published var remotePaused: Bool = false
+    func toggleRemotePause() {
+        remotePaused.toggle()
+        L(remotePaused ? "⏸ 遥控器已暂停（拦截所有按键）" : "▶️ 遥控器已恢复")
+    }
+    // 方向键/OK 延迟确认：按下后等 40ms 还在按才真正触发，过滤 <40ms 的抖动脉冲。
+    // 抖动 release（usage=0）到来时若 pendingDirection 还未触发，取消它。
+    private var pendingDirectionUsage: Int = 0
+    private var pendingDirectionMapping: ButtonMapping?
+    private var pendingDirectionTimer: Timer?
     // 抖动检测：拿起遥控器/手指碰圆环时会产生密集且多变的 usage 切换（0xF1/0x28/0x51 混跳），
     // 真实按键是单一 usage 持续保持。记录近期（200ms 内）出现的不同 usage 集合，
     // 若短时间内切换 ≥3 种不同 usage，判定为抖动，忽略这批脉冲，避免误删除。
@@ -1093,18 +1124,107 @@ final class Engine: ObservableObject {
     func connectSelectedRemote() {
         userDisconnected = false
         L("📎 用户请求连接设备")
-        connectSelectedIfNeeded()
+        // 若之前用 blueutil 真断了，先用 blueutil 重连系统蓝牙，再让 App 重新搜索 ATVV 通道
+        let rawName = discoveredRemotes.first(where: { $0.id == selectedRemoteID })?.name ?? ""
+        reconnectViaBlueutilThenApp(deviceName: rawName)
+    }
+    /// 用 blueutil 重连系统蓝牙，成功/失败后都让 App 重新搜索（BLE 通道独立于系统 HID）。
+    private func reconnectViaBlueutilThenApp(deviceName: String) {
+        if deviceName.isEmpty || (
+            !FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/blueutil")
+            && !FileManager.default.isExecutableFile(atPath: "/usr/local/bin/blueutil")) {
+            // 无 blueutil 或无名，直接走 App 重连
+            connectSelectedIfNeeded()
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 找 MAC（从所有 paired 设备里匹配名字）
+            let listTask = Process()
+            listTask.launchPath = "/usr/bin/env"
+            listTask.arguments = ["blueutil", "--paired"]
+            let pipe = Pipe(); listTask.standardOutput = pipe; listTask.standardError = Pipe()
+            do { try listTask.run(); listTask.waitUntilExit() } catch { return }
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            var matchedMAC: String?
+            for line in output.split(separator: "\n") {
+                let s = String(line)
+                if s.contains("name: \"\(deviceName)\"") || s.contains(deviceName) {
+                    if let r = s.range(of: "address: ([0-9a-fA-F-]{17})", options: .regularExpression) {
+                        matchedMAC = s[r].replacingOccurrences(of: "address: ", with: "")
+                    }
+                }
+            }
+            if let mac = matchedMAC {
+                let connTask = Process()
+                connTask.launchPath = "/usr/bin/env"
+                connTask.arguments = ["blueutil", "--connect", mac]
+                try? connTask.run(); connTask.waitUntilExit()
+                Task { @MainActor in self.L("🔌 blueutil 重连系统蓝牙：\(deviceName) (\(mac))") }
+            }
+            // 无论 blueutil 成功与否，都让 App 重新搜索连接 ATVV 通道
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self.connectSelectedIfNeeded()
+                if self.dev == nil { self.startSearching() }
+            }
+        }
     }
     /// 菜单栏「断开设备」：断开当前遥控器，且不自动重连（直到用户主动连接）。
     func disconnectCurrentRemote() {
         userDisconnected = true
         streaming = false; micStreaming = false
+        // 获取当前设备原始名（blueutil 按名字匹配 MAC）
+        let rawName = dev?.name ?? discoveredRemotes.first(where: { $0.id == selectedRemoteID })?.name ?? ""
         if let cur = dev { cm?.cancelPeripheralConnection(cur) }
         dev = nil; tx = nil; capsSent = false
         remoteConnected = false; handshakeReady = false
         if let i = discoveredRemotes.firstIndex(where: { $0.connected }) { discoveredRemotes[i].connected = false }
         recoverStuckModifiers()
         L("✂️ 用户请求断开设备，不再自动重连")
+        // 用 blueutil 真断系统蓝牙（BLE 通道断开对按键无效，按键走系统 HID 直传；
+        // 只有系统蓝牙断开才能让遥控器彻底停止发 HID 报告）。
+        disconnectViaBlueutil(deviceName: rawName)
+    }
+    /// 用 blueutil 按设备名匹配 MAC 并断开系统蓝牙连接（彻底断，防自发误触）。
+    private func disconnectViaBlueutil(deviceName: String) {
+        guard !deviceName.isEmpty else { return }
+        // blueutil 可能未安装，优雅降级
+        guard FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/blueutil")
+                || FileManager.default.isExecutableFile(atPath: "/usr/local/bin/blueutil") else {
+            L("⚠️ 未安装 blueutil，无法真断蓝牙。安装：brew install blueutil")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 1) 读已连接设备列表，匹配名字拿 MAC
+            let listTask = Process()
+            listTask.launchPath = "/usr/bin/env"
+            listTask.arguments = ["blueutil", "--connected"]
+            let pipe = Pipe(); listTask.standardOutput = pipe; listTask.standardError = pipe
+            do { try listTask.run(); listTask.waitUntilExit() } catch { return }
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            // 输出行格式: address: xx-xx-xx-xx-xx-xx, connected, ..., name: "设备名", ...
+            var matchedMAC: String?
+            for line in output.split(separator: "\n") {
+                let s = String(line)
+                if s.contains("name: \"\(deviceName)\"") || s.contains(deviceName) {
+                    if let addrRange = s.range(of: "address: ([0-9a-fA-F-]{17})", options: .regularExpression) {
+                        matchedMAC = s[addrRange].replacingOccurrences(of: "address: ", with: "")
+                    }
+                }
+            }
+            guard let mac = matchedMAC else {
+                Task { @MainActor in self.L("⚠️ blueutil 未找到设备「\(deviceName)」") }
+                return
+            }
+            // 2) 断开（不 unpair，便于重连）
+            let discTask = Process()
+            discTask.launchPath = "/usr/bin/env"
+            discTask.arguments = ["blueutil", "--disconnect", mac]
+            do { try discTask.run(); discTask.waitUntilExit() } catch { return }
+            let status = discTask.terminationStatus
+            Task { @MainActor in
+                self.L(status == 0 ? "🔌 blueutil 已断开系统蓝牙：\(deviceName) (\(mac))" : "⚠️ blueutil 断开失败（状态 \(status)）")
+            }
+        }
     }
     fileprivate func didDiscover(_ p: CBPeripheral, rssi: Int) {
         // 加入候选列表（addCandidate 内部按 id/名称去重），扫描继续让用户能看到所有设备。
@@ -1368,6 +1488,13 @@ final class Engine: ObservableObject {
     /// Xiaomi remotes expose both compact and keyboard-array report layouts.
     /// Normalize either form before dispatching a button action.
     private func handleHIDReport(_ bytes: [UInt8]) {
+        // 诊断模式：记录所有 HID 报告原始字节（含被过滤的圆盘/圆环），用于排查"静置自发误触"。
+        // 通过 hidDiagMode 开关控制，避免正常使用时刷屏。标注报告格式便于区分真实按压 vs 自发噪声。
+        if hidDiagMode {
+            let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+            let fmt = bytes.count == 7 && bytes[0] == 0x01 ? "01格式" : (bytes.count == 7 && bytes[0] == 0x03 ? "03格式" : "其他")
+            L("🔬HID原始[\(fmt) \(bytes.count)字节]: \(hex)")
+        }
         let known = Set(config.buttons.map { UInt8(truncatingIfNeeded: $0.usage) } + [HIDMap.voiceUsage])
         // 先尝试解析已知 usage——即使报告来自鼠标/指针通道，若内含已知按键也优先识别。
         if let usage = XiaomiRemoteHIDParser.usage(in: bytes, known: known) {
@@ -1382,6 +1509,8 @@ final class Engine: ObservableObject {
         // 接 RingScrollDecoder：连续 ≥3 帧、间隔 ≤80ms、同一字节位同方向，才发有界滚动；
         // 否则视为静置/不稳噪声，忽略。校准失败时保持静默（安全优先）。
         if bytes.count == 7 && bytes[0] == 0x03 {
+            // 圆盘默认关闭（防误触）。用户在 UI 开启后才解码滚动；关闭时直接静默丢弃。
+            guard ringEnabled else { return }
             let now = ProcessInfo.processInfo.systemUptime
             let hex = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
             if let evt = ringDecoder.consume(bytes, at: now) {
@@ -1410,6 +1539,16 @@ final class Engine: ObservableObject {
         if usage == 0x00 {
             longPressTimer?.invalidate(); longPressTimer = nil
             deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
+            // 方向键延迟确认取消：若 pendingDirection 还未触发（<40ms 就 release），视为抖动脉冲，
+            // 不发送 key-down，也不发 key-up（彻底静默），过滤拿起误触。
+            if pendingDirectionUsage != 0 {
+                L("方向/OK 短脉冲（<40ms），视为抖动忽略")
+                pendingDirectionTimer?.invalidate(); pendingDirectionTimer = nil
+                pendingDirectionUsage = 0; pendingDirectionMapping = nil
+                downButtonUsage = 0; downTarget = nil; longPressFired = false
+                recentUsages.removeAll()
+                return
+            }
             recentUsages.removeAll()   // release 时清抖动记录，允许下一轮真实按压
             if voiceHidDown { voiceHidDown = false; lastHidKeycodeAt[HIDMap.voiceKeycode] = now }
             if let t = downTarget {
@@ -1486,6 +1625,30 @@ final class Engine: ObservableObject {
             downButtonUsage = Int(usage); downTarget = m
             L("Back 已按下，按住 0.4 秒后开始删除…")
             startDeleteRepeat()
+            return
+        }
+        // 方向键/OK/Menu 等普通按键：延迟 40ms 确认，过滤 <40ms 的抖动脉冲（拿起误触）。
+        // 40ms 延迟人几乎无感，但足以滤掉抖动产生的孤立短脉冲。release 在 40ms 内到来则取消。
+        if Int(usage) == 0x28 || Int(usage) == 0x52 || Int(usage) == 0x51
+            || Int(usage) == 0x50 || Int(usage) == 0x4F {
+            pendingDirectionUsage = Int(usage)
+            pendingDirectionMapping = m
+            downButtonUsage = Int(usage)   // 标记为按下，防止 HID 重复 down 干扰
+            pendingDirectionTimer?.invalidate()
+            pendingDirectionTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self = self, self.pendingDirectionUsage == Int(usage) else { return }
+                    // 40ms 内没收到 release，确认是真实按压，发送 key-down
+                    if let pm = self.pendingDirectionMapping {
+                        self.downTarget = pm
+                        if pm.keycode >= KeyNames.kSpecialBase { self.startSpecial(pm.keycode) }
+                        else { self.postKey(CGKeyCode(pm.keycode), down: true, cmd: pm.cmd, shift: pm.shift, opt: pm.opt, ctrl: pm.ctrl) }
+                    }
+                    self.pendingDirectionUsage = 0
+                    self.pendingDirectionMapping = nil
+                    self.pendingDirectionTimer = nil
+                }
+            }
             return
         }
         if let long = m.longPressKeycode {
@@ -1592,23 +1755,60 @@ final class Engine: ObservableObject {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
     }
+    // 导航/编辑类键码集合：用于速率熔断统计。
+    // 这些是遥控器自发误触的主角（Delete/方向/回车/空格/Esc），Mac 键盘连续高频敲它们很少见。
+    private static let navKeycodes: Set<CGKeyCode> = [
+        0x33,       // Delete / Backspace
+        0x7E, 0x7D, 0x7B, 0x7C,  // 方向 上/下/左/右
+        0x24,       // Return
+        0x31,       // Space
+        0x35,       // Esc
+    ]
     // called from tap thread — keep it cheap & thread-safe-ish (dictionary read)
     nonisolated func shouldSuppress(_ kc: CGKeyCode) -> Bool {
-        // suppress if the remote produced this keycode within the last 120ms AND that button is mapped to something other than "keep original"
         // 注意：此函数从 CGEvent tap 线程高频调用，绝不能在里面打日志或做重活，
         // 否则会拖慢整个事件流（曾因每次都 L() 导致主线程繁忙、语音卡顿、Back 删除时序错乱）。
         var suppress = false
         MainActor.assumeIsolated {
             let now = ProcessInfo.processInfo.systemUptime
             // 设备层映射生效后（hardwareGlobeReady==true），F5 已被重映射成 Globe/LeftControl，
-            // 这时放行是【正常】的，绝不能报警告。仅在"映射未就绪且 F5 漏过来"时才吞掉，
-            // 防止触发 macOS 原生听写。
+            // 这时放行是【正常】的。仅在"映射未就绪且 F5 漏过来"时才吞掉，防止触发 macOS 原生听写。
             if kc == HIDMap.voiceKeycode {
                 suppress = !hardwareGlobeReady && (voiceHidDown || (lastHidKeycodeAt[kc].map { now - $0 < 0.12 } ?? false))
                 return
             }
+            // ① 全局暂停：开启时拦截所有导航/编辑类键（用户离开时一键开启）
+            if remotePaused && Self.navKeycodes.contains(kc) {
+                suppress = true
+                return
+            }
+            // ② 速率熔断（持续拦截直到静默）：导航/编辑类键在 2 秒内 ≥8 次，
+            // 判定设备异常（Pro 静置自发特征）。触发后持续拦截，直到连续 10 秒
+            // 无导航键事件才解除（自发噪声持续不断会被一直挡住）。
+            if Self.navKeycodes.contains(kc) {
+                navKeyTimestamps = navKeyTimestamps.filter { now - $0 < 2.0 }
+                navKeyTimestamps.append(now)
+                if !circuitBreakerActive && navKeyTimestamps.count >= 8 {
+                    circuitBreakerActive = true
+                    let count = navKeyTimestamps.count
+                    Task { @MainActor in self.L("🛑 速率熔断：2秒内 \(count) 次导航键，持续拦截直到静默 10 秒") }
+                }
+                if circuitBreakerActive {
+                    // 距上次导航键事件超过 10 秒才视为静默，解除熔断；否则继续拦截
+                    if now - lastNavKeyAt > 10.0 {
+                        circuitBreakerActive = false
+                        navKeyTimestamps.removeAll()
+                        Task { @MainActor in self.L("✅ 熔断解除：已静默 10 秒，恢复按键处理") }
+                    } else {
+                        lastNavKeyAt = now   // 更新最近事件时间，持续 spam 就一直挡
+                        suppress = true
+                        return
+                    }
+                }
+                lastNavKeyAt = now
+            }
+            // ③ 原有逻辑：遥控器 HID 通道产生的按键在 120ms 内被映射，吞掉避免双触发
             if let ts = lastHidKeycodeAt[kc], now - ts < 0.12 {
-                // find which usage produced this keycode
                 if let usage = HIDMap.usageToKeycode.first(where: { $0.value == kc })?.key,
                    let m = config.buttons.first(where: { $0.usage == Int(usage) }),
                    m.keycode != KeyNames.kNone {
