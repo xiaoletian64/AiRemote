@@ -95,6 +95,45 @@ pub fn run() {
                 )?;
             }
 
+            // 系统托盘：App 在后台运行时不抢焦点，让 enigo 的 SendInput 能到前台窗口
+            let tray = tauri::tray::TrayIconBuilder::with_id("main-tray")
+                .tooltip("小米超级键盘")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&tauri::menu::Menu::with_items(
+                    app,
+                    &[
+                        &tauri::menu::MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?,
+                        &tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
+                    ],
+                )?)
+                .on_menu_event(|app, event| {
+                    match event.id().as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => { app.exit(0); }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, .. } = event {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+            let _ = tray; // 保持托盘存活
+
             // 初始化配置
             let config = Arc::new(Mutex::new(Config::load()));
             let key_mapper = Arc::new(Mutex::new(KeyMapper::new(config.clone())));

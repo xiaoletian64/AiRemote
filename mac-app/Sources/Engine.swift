@@ -1462,6 +1462,8 @@ final class Engine: ObservableObject {
             let page = IOHIDElementGetUsagePage(element)
             let usage = IOHIDElementGetUsage(element)
             let rawValue = IOHIDValueGetIntegerValue(value)
+            // 🔬 临时诊断：确认 value callback 是否触发，记录每个事件的 page/usage/value
+            NSLog("[小米超级键盘][DIAG] valueCallback page=0x%02X usage=0x%04X rawValue=%d", page, usage, rawValue)
             if Thread.isMainThread {
                 MainActor.assumeIsolated { me.handleHIDValue(page: page, usage: usage, rawValue: rawValue) }
             } else {
