@@ -72,8 +72,8 @@ body {
       <div style="font-size:14px;color:#6e6e73;margin-top:8px;line-height:1.8;">
         1. 把遥控器和 Windows 蓝牙配对（系统设置 → 蓝牙 → 添加设备）<br>
         2. 配对后遥控器自动连接，按键即可使用<br>
-        3. 在「按键」页选语音键模式（Win+H 听写 / Ctrl / Win / 麦克风开关）<br>
-        4. 要用语音转麦克风：安装 VB-Cable（设置页有链接）
+        3. 在「按键」页选语音键模式（默认 Win+H 调用 Windows 语音听写）<br>
+        4. 首次验收请先按「重新扫描设备」，再逐个按键；原始报告会写入诊断日志
       </div>
     </div>
     <button class="btn btn-primary" onclick="rescan()">重新扫描设备</button>
@@ -89,14 +89,16 @@ body {
 
   <div id="tab-settings" class="hidden">
     <div class="card" style="margin-bottom:12px;">
-      <h3>🎙️ 语音转麦克风（VB-Cable）</h3>
+      <h3>🎙️ 语音功能状态</h3>
       <div style="font-size:14px;color:#6e6e73;margin-top:8px;">
-        安装 VB-Cable 虚拟声卡后，遥控器语音可作为 Windows 麦克风输入。<br>
-        下载：<a href="https://vb-audio.com/Cable/" target="_blank">VB-Audio Cables 官网</a>
+        当前已实现语音键快捷键（默认 Win+H）。遥控器 ATVV 音频转发到 VB-Cable 尚未实现，
+        因此请勿在本次验收中把它当作可用功能。<br>
+        若后续接入音频输出，VB-Cable 可从 <a href="https://vb-audio.com/Cable/" target="_blank">官网</a> 获取。
       </div>
     </div>
     <div class="card">
       <h3>📋 诊断日志</h3>
+      <div class="detail" style="margin:8px 0;word-break:break-all;">日志文件：<code id="log-path">加载中…</code></div>
       <div class="log-view" id="log-view"><div>日志加载中…</div></div>
     </div>
   </div>
@@ -118,8 +120,9 @@ function switchTab(name, el) {
 async function loadConfig() {
   currentConfig = await invoke('get_config');
   const remote = document.getElementById('card-remote');
-  remote.querySelector('.detail').textContent = '已连接（HID 监听中）';
-  remote.classList.add('ready');
+  const connected = await invoke('get_status');
+  remote.querySelector('.detail').textContent = connected ? '已连接（已收到遥控器按键）' : '等待遥控器按键…';
+  remote.classList.toggle('ready', connected);
   invoke('get_voice_modes').then(modes => {
     const m = modes.find(mo => mo[0] === currentConfig.voice_mode);
     const voice = document.getElementById('card-voice');
@@ -161,12 +164,17 @@ async function loadMapping() {
 }
 
 async function loadLog() {
-  const log = await invoke('get_log');
+  const [log, path] = await Promise.all([invoke('get_log'), invoke('get_diagnostic_log_path')]);
+  document.getElementById('log-path').textContent = path;
   document.getElementById('log-view').innerHTML =
     log.length ? log.map(l => `<div>${l}</div>`).join('') : '<div>暂无日志</div>';
 }
 
-async function rescan() { await invoke('rescan'); alert('正在重新扫描…'); }
+async function rescan() {
+  const devices = await invoke('rescan');
+  alert(devices.length ? `发现 ${devices.length} 个候选 HID 接口；详情已写入诊断日志。` : '未发现候选遥控器接口；请检查蓝牙配对，详情见诊断日志。');
+  await loadLog();
+}
 
 loadConfig();
 setInterval(() => loadConfig(), 3000);
