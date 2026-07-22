@@ -1633,16 +1633,14 @@ final class Engine: ObservableObject {
             if voiceHidDown { voiceHidDown = false; lastHidKeycodeAt[HIDMap.voiceKeycode] = now }
             if let t = downTarget {
                 if t.usage == 0xF1 && t.keycode == 0x33 {
-                    // Back（删除键）：down 时已发过单击的 keyDown+keyUp，连续删除期间
-                    // 发的也都是完整 down/up 对，所以松开只需停定时器，不再补 keyUp。
-                    // deleteRepeatTimer 已在上面 invalidate，这里只做脉冲时长诊断。
+                    // Back 键不再承担删除（避免遥控器自发 0xF1 误删用户内容）。
+                    // 仅做脉冲时长诊断，不主动发任何删除键。Back 的实际行为交给系统透传。
+                    // deleteRepeatTimer 已在上面 invalidate。
                     let pulseMs = Int((now - backDownAt) * 1000)
                     if pulseMs < 35 {
-                        L("Back(删除) 短脉冲 \(pulseMs)ms，视为抖动忽略")
-                    } else if deleteRepeatTimer != nil {
-                        L("Back(删除) 连续删除停止（按下 \(pulseMs)ms）")
+                        L("Back(0xF1) 短脉冲 \(pulseMs)ms，视为抖动忽略")
                     } else {
-                        L("Back(删除) 松开（按下 \(pulseMs)ms）")
+                        L("Back(0xF1) 松开（按下 \(pulseMs)ms，不删除）")
                     }
                 } else if t.longPressKeycode != nil {
                     if !longPressFired { tapMapping(t) }
@@ -1714,18 +1712,6 @@ final class Engine: ObservableObject {
             downButtonUsage = Int(usage); downTarget = m
             L("OK(删除) 已按下，按住 0.4 秒后开始删除…")
             startDeleteRepeat(usage: 0x28)
-            return
-        }
-        if Int(usage) == 0xF1 && m.keycode == 0x33 {
-            // Back「单击删 1 个 + 长按连续删除」：down 时先发一次完整 keyDown+keyUp
-            // 作为单击的那一下；同时启动 0.4s 延迟的连续删除定时器。松开时停定时器即可
-            // （单击的 keyUp 已在 down 时发过，连续删除期间发的都是完整 down/up 对）。
-            backDownAt = now
-            downButtonUsage = Int(usage); downTarget = m
-            postKey(0x33, down: true, cmd: false)
-            postKey(0x33, down: false, cmd: false)
-            L("Back(删除) 已按下，按住 0.4 秒后开始连续删除…")
-            startDeleteRepeat(usage: 0xF1)
             return
         }
         // 方向键/OK/Menu 等普通按键：延迟 40ms 确认，过滤 <40ms 的抖动脉冲（拿起误触）。

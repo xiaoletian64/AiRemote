@@ -243,7 +243,7 @@ struct Config: Codable {
         0x50:(0x7B,false,false,false,false),  // ←
         0x4F:(0x7C,false,false,false,false),  // →
         0x28:(0x24,false,false,false,false),  // OK → Enter
-        0xF1:(0x33,false,false,false,false),  // Back → Delete（单击删 1 个，按住连续删除）
+        0xF1:(KeyNames.kNone,false,false,false,false),  // Back → 保持原键（交给系统透传，不主动删除，避免自发误删）
         0x4A:(KeyNames.kOpenNotes,false,false,false,false),   // Home → 打开备忘录
         0x65:(0x35,false,false,false,false),  // Menu → Esc
         0x66:(KeyNames.kLockScreen,false,false,false,false), // Power → 仅锁屏
@@ -306,7 +306,7 @@ final class ConfigStore {
                 cfg.buttons[i].ctrl = false
                 cfg.buttons[i].longPressKeycode = longPress
             }
-            installDefault(0xF1, keycode: 0x33)                         // Back → Delete
+            installDefault(0xF1, keycode: KeyNames.kNone)              // Back → 保持原键（不主动删除，避免自发误删）
             installDefault(0x4A, keycode: KeyNames.kOpenNotes)          // Home → 打开备忘录（短按即打开）
             installDefault(0x65, keycode: 0x35, longPress: KeyNames.kInterrupt) // Menu → Esc / ⌃C
             installDefault(0x66, keycode: KeyNames.kLockScreen, longPress: KeyNames.kShutdownConfirm)
@@ -332,6 +332,18 @@ final class ConfigStore {
             }
         }
         if volumeFixed { save(cfg) }
+        // Back 键安全回退：早期版本（v6/v7）曾把 Back(0xF1) 默认设成 Delete(0x33)，
+        // 但遥控器 Pro 型号会自发 0xF1 报告，配合 App 主动发 0x33 会在用户不知情时删字。
+        // 现在把"恰好是默认 0x33 且无修饰键、无长按动作"的 Back 改回 kNone（保持原键，
+        // 交给系统透传）。只匹配默认形态，用户主动录制的删除映射（带修饰键或长按）不动。
+        if let i = cfg.buttons.firstIndex(where: { $0.usage == 0xF1 }),
+           cfg.buttons[i].keycode == 0x33,
+           cfg.buttons[i].cmd == false, cfg.buttons[i].shift == false,
+           cfg.buttons[i].opt == false, cfg.buttons[i].ctrl == false,
+           cfg.buttons[i].longPressKeycode == nil {
+            cfg.buttons[i].keycode = KeyNames.kNone
+            save(cfg)
+        }
         // Keep the original Menu → Esc default usable for configurations saved
         // before long-press support was introduced.
         if let menu = cfg.buttons.firstIndex(where: { $0.usage == 0x65 }),
