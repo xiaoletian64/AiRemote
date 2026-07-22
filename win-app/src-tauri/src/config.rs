@@ -86,7 +86,7 @@ pub mod vk {
     pub const LWIN: u16 = 0x5B;
     pub const RWIN: u16 = 0x5C;
     // 字母 A-Z = 0x41-0x5A
-    pub fn letter(c: char) -> u16 { (c as u16) | 0x20 }  // 小写转 VK
+    pub fn letter(c: char) -> u16 { c.to_ascii_uppercase() as u16 }
     // 数字 0-9 = 0x30-0x39
 }
 
