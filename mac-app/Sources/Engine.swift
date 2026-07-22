@@ -1462,8 +1462,6 @@ final class Engine: ObservableObject {
             let page = IOHIDElementGetUsagePage(element)
             let usage = IOHIDElementGetUsage(element)
             let rawValue = IOHIDValueGetIntegerValue(value)
-            // 🔬 临时诊断：确认 value callback 是否触发，记录每个事件的 page/usage/value
-            NSLog("[小米超级键盘][DIAG] valueCallback page=0x%02X usage=0x%04X rawValue=%d", page, usage, rawValue)
             if Thread.isMainThread {
                 MainActor.assumeIsolated { me.handleHIDValue(page: page, usage: usage, rawValue: rawValue) }
             } else {
@@ -1473,6 +1471,25 @@ final class Engine: ObservableObject {
             }
         }
         IOHIDManagerRegisterInputValueCallback(mgr, valueCallback, ctx)
+        // 同时注册 report callback：value callback 在部分 BLE HID 设备上不可靠（收不到事件），
+        // report callback 直接拿原始报告字节，更可靠。handleHIDReport 已含完整解析逻辑
+        // （XiaomiRemoteHIDParser 翻译 compact/keyboard-array/consumer 三种形态）。
+        // 两条路径都调 hidReport(usage:)，但 hidReport 内部有 downButtonUsage 去重，
+        // 同一键不会双触发。report callback 是音量键等 special 动作的主路径。
+        let reportCallback: IOHIDReportCallback = { context, result, _, type, reportID, report, length in
+            guard result == kIOReturnSuccess, let context else { return }
+            let me = Unmanaged<Engine>.fromOpaque(context).takeUnretainedValue()
+            let n = min(Int(length), 64)
+            let bytes = Array(UnsafeBufferPointer(start: report, count: n))
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { me.handleHIDReport(bytes) }
+            } else {
+                DispatchQueue.main.async {
+                    Task { @MainActor in me.handleHIDReport(bytes) }
+                }
+            }
+        }
+        IOHIDManagerRegisterInputReportCallback(mgr, reportCallback, ctx)
         // 枚举设备用于日志
         inputMonitoringOK = true
         if let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty {
@@ -2107,8 +2124,12 @@ final class Engine: ObservableObject {
         guard hasVolume,
               AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &vol) == noErr else { return }
         let delta: Float32 = 1.0 / 16.0
+        let oldVol = vol
         vol = max(0, min(1, vol + Float32(step) * delta))
+        // 读到的音量和新音量一样（已在边界）就不写，避免无意义调用 + 日志噪音
+        guard abs(vol - oldVol) > 0.0001 else { return }
         guard AudioObjectSetPropertyData(dev, &addr, 0, nil, size, &vol) == noErr else { return }
+        L("🔊 音量\(step > 0 ? "+" : "−") \(String(format: "%.0f%%", oldVol * 100))→\(String(format: "%.0f%%", vol * 100))")
         // per-channel：同步 channel 2（立体声右声道）
         if addr.mElement == 1 {
             var addr2 = addr; addr2.mElement = 2

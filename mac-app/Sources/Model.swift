@@ -317,6 +317,21 @@ final class ConfigStore {
             UserDefaults.standard.set(7, forKey: defaultsVersionKey)
             save(cfg)
         }
+        // 音量键自愈：不依赖 mappingDefaultsVersion。老用户的 version 可能已被早期版本
+        // 占用（升到 7 时 v7 块还没有音量键代码），导致音量键永远停在 kNone（保持原键）。
+        // 而内核 No-Event 又吞了音量键的原始 HID 事件，kNone 不动作 → 音量键彻底失效。
+        // 这里每次加载都检查：音量键若是 kNone（默认值，用户几乎不会主动设成"保持原样"），
+        // 就升级到 CoreAudio 合成调音量。已自定义（非 kNone）的用户不受影响。
+        var volumeFixed = false
+        for i in cfg.buttons.indices where cfg.buttons[i].usage == 0x80 || cfg.buttons[i].usage == 0x81 {
+            if cfg.buttons[i].keycode == KeyNames.kNone {
+                cfg.buttons[i].keycode = (cfg.buttons[i].usage == 0x80) ? KeyNames.kVolumeUp : KeyNames.kVolumeDown
+                cfg.buttons[i].cmd = false; cfg.buttons[i].shift = false
+                cfg.buttons[i].opt = false; cfg.buttons[i].ctrl = false
+                volumeFixed = true
+            }
+        }
+        if volumeFixed { save(cfg) }
         // Keep the original Menu → Esc default usable for configurations saved
         // before long-press support was introduced.
         if let menu = cfg.buttons.firstIndex(where: { $0.usage == 0x65 }),
