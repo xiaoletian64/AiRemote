@@ -5,12 +5,15 @@ mod mapping;
 mod adpcm;
 mod dsp;
 mod diagnostics;
+mod ble;
+mod audio;
 
 use config::{Config, VoiceMode};
 use mapping::KeyMapper;
 use hid::HidListener;
 use diagnostics::Diagnostics;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use tauri::{Manager, State};
 
 /// 应用状态
@@ -184,6 +187,52 @@ pub fn run() {
                         km.lock().unwrap().on_key_up(usage);
                     }
                 });
+            }
+
+            // 启动 BLE 语音 + 音频输出
+            // 音频：初始化 ring buffer + cpal 输出（VB-Cable 或默认设备）
+            let audio_out = match audio::AudioOut::new() {
+                Ok(ao) => {
+                    diagnostics::record(&log, "✅ 音频输出已启动".to_string());
+                    Some(ao)
+                }
+                Err(e) => {
+                    diagnostics::record(&log, format!("⚠️ 音频输出初始化失败: {}（语音转发不可用）", e));
+                    None
+                }
+            };
+
+            // BLE 语音：在 tokio runtime 中异步运行
+            let ble_voice = ble::BleVoice::new();
+            let ble_voice_ref = ble_voice; // 需要保持引用
+            if let Some(ref ao) = audio_out {
+                let ring = ao.ring.clone();
+                let ble = ble::BleVoice::new();
+                let streaming = ble.streaming.clone();
+                let mic_streaming = ble.mic_streaming.clone();
+                let packet_count = ble.packet_count.clone();
+                let voice_connected = ble.voice_connected.clone();
+                let log_for_ble = log.clone();
+
+                // 用独立线程跑 tokio runtime（不阻塞 Tauri 主线程）
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().expect("无法创建 tokio runtime");
+                    rt.block_on(async {
+                        let ble = ble::BleVoice::new();
+                        ble.streaming.store(true, Ordering::Relaxed); // 默认 streaming=true（和 Mac 一致）
+                        ble.run(ring, move |msg| {
+                            diagnostics::record(&log_for_ble, msg.to_string());
+                        }).await;
+                    });
+                });
+                // mic_streaming 默认开启（VB-Cable 就绪时自动转发）
+                mic_streaming.store(audio::AudioOut::vbcable_found(), Ordering::Relaxed);
+                diagnostics::record(&log, format!(
+                    "BLE 语音已启动（VB-Cable: {}）",
+                    if audio::AudioOut::vbcable_found() { "已检测到" } else { "未检测到" }
+                ));
+            } else {
+                diagnostics::record(&log, "BLE 语音未启动（音频输出不可用）".to_string());
             }
 
             let state = AppState {
