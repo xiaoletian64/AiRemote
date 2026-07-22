@@ -121,8 +121,8 @@ impl AudioOut {
     /// 是否检测到 VB-Cable
     pub fn vbcable_found() -> bool {
         let mut host = cpal::default_host();
-        if let Ok(mut devices) = host.output_devices() {
-            return host.any(|d| {
+        if let Ok(devices) = host.output_devices() {
+            return devices.any(|d| {
                 d.name()
                     .map(|n| n.contains("CABLE Input") || n.contains("VB-Audio"))
                     .unwrap_or(false)
