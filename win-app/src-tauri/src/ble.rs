@@ -91,25 +91,20 @@ impl BleVoice {
             loop {
                 let peripherals = adapter.peripherals().await.unwrap_or_default();
                 for p in &peripherals {
-                    // 尝试连接，连接后检查是否有 ATVV 服务
-                    if let Ok(props) = p.properties().await {
-                        if let Some(name) = &props.name {
+                    // 检查设备名称
+                    if let Ok(Some(props)) = p.properties().await {
+                        if let Some(ref name) = props.local_name {
                             let name_lower = name.to_lowercase();
-                            // 匹配小米/联想遥控器名
                             if name_lower.contains("xiaomi")
                                 || name_lower.contains("遥控")
                                 || name_lower.contains("remote")
-                                || name_lower.contains("mi")
                                 || name_lower.contains("rc003")
-                                || name_lower.contains("lenovo")
                                 || name_lower.contains("xiaoxin")
                             {
                                 return p.clone();
                             }
                         }
-                    }
-                    // 也检查 advertised services
-                    if let Ok(props) = p.properties().await {
+                        // 也检查 advertised services
                         if props.services.contains(&UUID_ATVV) {
                             return p.clone();
                         }
@@ -137,10 +132,7 @@ impl BleVoice {
             .await
             .map_err(|e| format!("发现服务失败: {}", e))?;
 
-        let chars = peripheral
-            .characteristics()
-            .await
-            .map_err(|e| format!("获取特征失败: {}", e))?;
+        let chars = peripheral.characteristics();
 
         // 找 ATVV 特征
         let tx = chars

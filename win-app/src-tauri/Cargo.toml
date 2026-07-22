@@ -32,6 +32,8 @@ cpal = "0.15"
 tokio = { version = "1", features = ["full"] }
 # tokio stream（BLE 通知流迭代）
 tokio-stream = "0.1"
+# UUID（BLE 服务/特征标识）
+uuid = "1"
 # 时间
 chrono = "0.4"
 
