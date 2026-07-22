@@ -1714,6 +1714,16 @@ final class Engine: ObservableObject {
             startDeleteRepeat(usage: 0x28)
             return
         }
+        if Int(usage) == 0xF1 && m.keycode == 0x33 {
+            // Back「单击删 1 个字」：down 时发一次完整 keyDown+keyUp，不启动连续删除。
+            // 用户已知接受 Pro 遥控器自发 0xF1 的误删风险（仅单字，不会连续删一片）。
+            backDownAt = now
+            downButtonUsage = Int(usage); downTarget = nil   // downTarget=nil：release 不再补发
+            postKey(0x33, down: true, cmd: false)
+            postKey(0x33, down: false, cmd: false)
+            L("Back(删除) 单击删除 1 字")
+            return
+        }
         // 方向键/OK/Menu 等普通按键：延迟 40ms 确认，过滤 <40ms 的抖动脉冲（拿起误触）。
         // 40ms 延迟人几乎无感，但足以滤掉抖动产生的孤立短脉冲。release 在 40ms 内到来则取消。
         if Int(usage) == 0x28 || Int(usage) == 0x52 || Int(usage) == 0x51
