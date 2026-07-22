@@ -2,7 +2,7 @@
 // 16kHz mono Float32，和 Mac 版完全一致，无需重采样。
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SampleRate, Stream};
+use cpal::{SampleFormat, Stream};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -52,6 +52,8 @@ pub struct AudioOut {
     pub ring: Arc<AudioRing>,
     pub device_name: String,
     pub using_vbcable: bool,
+    pub sample_rate: u32,
+    pub channels: u16,
     _stream: Stream, // 保持 stream 存活（drop 会停止输出）
 }
 
@@ -84,30 +86,31 @@ impl AudioOut {
             using_vbcable
         );
 
+        // VB-CABLE 在 Windows 上通常是 44.1/48kHz 双声道，而遥控器源是 16kHz
+        // 单声道。选择设备支持的 F32 配置，输出回调中再做简单重采样和声道复制。
         let supported_config = device
             .supported_output_configs()
             .map_err(|e| format!("查询设备配置失败: {}", e))?
-            .find(|c| {
-                c.channels() == 1
-                    && c.sample_format() == SampleFormat::F32
-                    && c.min_sample_rate() <= SampleRate(16000)
-                    && c.max_sample_rate() >= SampleRate(16000)
-            })
-            .ok_or("输出设备不支持 16kHz 单声道 Float32；请在 VB-CABLE 声音设置中启用此格式")?;
+            .find(|c| c.sample_format() == SampleFormat::F32)
+            .ok_or("输出设备不支持 Float32 音频；当前版本请将 VB-CABLE 配置为共享模式默认格式")?;
 
-        // 固定 16kHz（和 ADPCM 解码输出一致），但从已验证的设备配置派生，
-        // 防止 CI 或实际设备在不支持的格式下创建 stream。
-        let config = supported_config
-            .with_sample_rate(SampleRate(16000))
-            .config();
+        let config = supported_config.with_max_sample_rate().config();
+        let sample_rate = config.sample_rate.0;
+        let channels = config.channels as usize;
+        let playback = Arc::new(Mutex::new(PlaybackState::new(sample_rate)));
+        let playback_clone = playback.clone();
 
         let stream = device
             .build_output_stream(
                 &config,
                 move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    // 从 ring buffer 取数据，不足补零
-                    let samples = ring_clone.pop(output.len());
-                    output.copy_from_slice(&samples);
+                    let mut state = playback_clone.lock().unwrap();
+                    for frame in output.chunks_exact_mut(channels) {
+                        let sample = state.next_sample(&ring_clone);
+                        for channel in frame {
+                            *channel = sample;
+                        }
+                    }
                 },
                 |err| log::error!("cpal 音频错误: {:?}", err),
                 None,
@@ -124,6 +127,8 @@ impl AudioOut {
             ring,
             device_name,
             using_vbcable,
+            sample_rate,
+            channels: config.channels,
             _stream: stream,
         })
     }
@@ -139,5 +144,30 @@ impl AudioOut {
             });
         }
         false
+    }
+}
+
+struct PlaybackState {
+    step: f64,
+    phase: f64,
+    current: f32,
+}
+
+impl PlaybackState {
+    fn new(output_rate: u32) -> Self {
+        Self {
+            step: 16_000.0 / output_rate as f64,
+            phase: 1.0,
+            current: 0.0,
+        }
+    }
+
+    fn next_sample(&mut self, ring: &AudioRing) -> f32 {
+        while self.phase >= 1.0 {
+            self.current = ring.pop(1)[0];
+            self.phase -= 1.0;
+        }
+        self.phase += self.step;
+        self.current
     }
 }

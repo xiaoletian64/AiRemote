@@ -231,6 +231,10 @@ pub fn run() {
                             }
                         ),
                     );
+                    diagnostics::record(&log, format!(
+                        "音频格式：{}Hz / {} 声道（源音频：16000Hz / 1 声道，已自动转换）",
+                        ao.sample_rate, ao.channels
+                    ));
                     Some(ao)
                 }
                 Err(e) => {
