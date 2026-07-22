@@ -2,56 +2,40 @@
 use crate::config::{self, vk, ButtonMapping, Config, SPECIAL_BASE};
 use enigo::{Axis, Button as MouseButton, Direction, Enigo, Key as EnigoKey, Keyboard, Mouse, Settings};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::thread;
 
-// Enigo 0.2 将旧版的 key_down/key_up/mouse_click API 统一为带 Direction 的
-// Keyboard/Mouse trait。保留这一层小适配器，让映射逻辑保持按下/松开语义清晰。
-enum Key {
-    Raw(u16),
-    Control,
-    Super,
-    Shift,
-    Alt,
-}
-
-trait LegacyInput {
-    fn key_down(&mut self, key: Key);
-    fn key_up(&mut self, key: Key);
-}
-
-impl LegacyInput for Enigo {
-    fn key_down(&mut self, key: Key) {
-        send_key(self, key, Direction::Press);
-    }
-
-    fn key_up(&mut self, key: Key) {
-        send_key(self, key, Direction::Release);
-    }
-}
-
-fn send_key(enigo: &mut Enigo, key: Key, direction: Direction) {
-    match key {
-        Key::Raw(code) => { let _ = enigo.raw(code, direction); }
-        Key::Control => { let _ = enigo.key(EnigoKey::Control, direction); }
-        Key::Super => { let _ = enigo.key(EnigoKey::Meta, direction); }
-        Key::Shift => { let _ = enigo.key(EnigoKey::Shift, direction); }
-        Key::Alt => { let _ = enigo.key(EnigoKey::Alt, direction); }
+/// Windows VK code → enigo Key 枚举。
+/// 关键修复：不能用 enigo.raw()（它期望 scancode 而非 VK code）。
+/// 用 enigo.key() + 命名 Key 枚举，enigo 内部正确处理 VK→scancode + 扩展键标志。
+fn vk_to_enigo_key(vk_code: u16) -> Option<EnigoKey> {
+    match vk_code {
+        vk::UP => Some(EnigoKey::UpArrow),
+        vk::DOWN => Some(EnigoKey::DownArrow),
+        vk::LEFT => Some(EnigoKey::LeftArrow),
+        vk::RIGHT => Some(EnigoKey::RightArrow),
+        vk::RETURN => Some(EnigoKey::Return),
+        vk::BACK => Some(EnigoKey::Backspace),
+        vk::DELETE => Some(EnigoKey::Delete),
+        vk::ESCAPE => Some(EnigoKey::Escape),
+        vk::SPACE => Some(EnigoKey::Space),
+        vk::TAB => Some(EnigoKey::Tab),
+        vk::HOME => Some(EnigoKey::Home),
+        vk::END => Some(EnigoKey::End),
+        vk::PRIOR => Some(EnigoKey::PageUp),
+        vk::NEXT => Some(EnigoKey::PageDown),
+        // 字母/数字用 Unicode（enigo 会自动转 scancode）
+        c if (0x30..=0x5A).contains(&c) => {
+            char::from_u32(c as u32).map(EnigoKey::Unicode)
+        }
+        _ => None,
     }
 }
 
-trait LegacyMouse {
-    fn mouse_click(&mut self, button: MouseButton);
-    fn mouse_scroll_y(&mut self, amount: i32);
-}
-
-impl LegacyMouse for Enigo {
-    fn mouse_click(&mut self, button: MouseButton) {
-        let _ = self.button(button, Direction::Click);
-    }
-
-    fn mouse_scroll_y(&mut self, amount: i32) {
-        let _ = self.scroll(amount, Axis::Vertical);
+/// 发送 VK 按键（按下或松开）
+fn send_vk(enigo: &mut Enigo, vk_code: u16, direction: Direction) {
+    if let Some(key) = vk_to_enigo_key(vk_code) {
+        let _ = enigo.key(key, direction);
     }
 }
 
@@ -59,18 +43,17 @@ impl LegacyMouse for Enigo {
 pub struct KeyMapper {
     config: Arc<Mutex<Config>>,
     enigo: Arc<Mutex<Enigo>>,
-    // 变速删除状态
     delete_repeating: Arc<Mutex<bool>>,
     delete_thread_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl KeyMapper {
     pub fn new(config: Arc<Mutex<Config>>) -> Self {
+        let enigo = Enigo::new(&Settings::default())
+            .unwrap_or_else(|e| panic!("无法初始化输入模拟: {}", e));
         Self {
             config,
-            enigo: Arc::new(Mutex::new(
-                Enigo::new(&Settings::default()).expect("无法初始化 Windows 输入模拟"),
-            )),
+            enigo: Arc::new(Mutex::new(enigo)),
             delete_repeating: Arc::new(Mutex::new(false)),
             delete_thread_handle: None,
         }
@@ -78,245 +61,166 @@ impl KeyMapper {
 
     /// 处理按键按下
     pub fn on_key_down(&mut self, usage: u16) {
-        // 语音键（usage 0x3E）：按 voice_mode 发不同组合键
         if usage == 0x3E {
-            let cfg = self.config.lock().unwrap();
-            let mode = cfg.voice_mode;
-            drop(cfg);
+            let mode = self.config.lock().unwrap().voice_mode;
             self.handle_voice_key_down(mode);
             return;
         }
-
         let cfg = self.config.lock().unwrap();
-        let mapping = match cfg.find_mapping(usage) {
-            Some(m) => m.clone(),
-            None => return,
-        };
+        let mapping = match cfg.find_mapping(usage) { Some(m) => m.clone(), None => return };
         drop(cfg);
 
-        // 特殊动作
-        if mapping.special >= SPECIAL_BASE {
-            self.execute_special(mapping.special, true);
-            return;
-        }
-
-        // Back → 变速删除（长按触发）
-        if usage == 0xF1 && mapping.vk == vk::BACK {
-            self.start_delete_repeat();
-            return;
-        }
-
-        // 普通 VK 按键
+        if mapping.special >= SPECIAL_BASE { self.execute_special(mapping.special, true); return; }
+        if usage == 0xF1 && mapping.vk == vk::BACK { self.start_delete_repeat(); return; }
         if mapping.vk != config::VK_NONE {
             let mut enigo = self.enigo.lock().unwrap();
-            let _ = enigo.key_down(Key::Raw(mapping.vk));
+            send_vk(&mut enigo, mapping.vk, Direction::Press);
         }
     }
 
     /// 处理按键松开
     pub fn on_key_up(&mut self, usage: u16) {
-        // 语音键松开：Ctrl/Win 修饰键需要发 key-up
         if usage == 0x3E {
-            let cfg = self.config.lock().unwrap();
-            let mode = cfg.voice_mode;
-            drop(cfg);
+            let mode = self.config.lock().unwrap().voice_mode;
             self.handle_voice_key_up(mode);
             return;
         }
-
         let cfg = self.config.lock().unwrap();
-        let mapping = match cfg.find_mapping(usage) {
-            Some(m) => m.clone(),
-            None => return,
-        };
+        let mapping = match cfg.find_mapping(usage) { Some(m) => m.clone(), None => return };
         drop(cfg);
 
-        // 停止变速删除
-        if usage == 0xF1 {
-            *self.delete_repeating.lock().unwrap() = false;
-        }
-
-        // 特殊动作松开
-        if mapping.special >= SPECIAL_BASE {
-            self.execute_special(mapping.special, false);
-            return;
-        }
-
-        // 普通 VK 松开
+        if usage == 0xF1 { *self.delete_repeating.lock().unwrap() = false; }
+        if mapping.special >= SPECIAL_BASE { self.execute_special(mapping.special, false); return; }
         if mapping.vk != config::VK_NONE {
             let mut enigo = self.enigo.lock().unwrap();
-            let _ = enigo.key_up(Key::Raw(mapping.vk));
+            send_vk(&mut enigo, mapping.vk, Direction::Release);
         }
     }
 
-    /// 启动变速删除（长按 Back 触发，macOS 原生指数加速曲线）
+    /// 启动变速删除（长按 Back）
     fn start_delete_repeat(&mut self) {
+        // 先停掉之前的线程（防止累积多次删除）
+        *self.delete_repeating.lock().unwrap() = false;
+        if let Some(handle) = self.delete_thread_handle.take() { let _ = handle.join(); }
         *self.delete_repeating.lock().unwrap() = true;
         let repeating = self.delete_repeating.clone();
         let enigo = self.enigo.clone();
 
-        // 先等 0.4 秒（防误触），然后开始指数加速删除
         self.delete_thread_handle = Some(thread::spawn(move || {
             thread::sleep(Duration::from_millis(400));
-            let mut interval = 0.12f32;  // 起始 120ms
-            let min_interval = 0.022f32;  // 最低 22ms
-            let decay = 0.92f32;          // 每次衰减
-
+            let mut interval = 0.12f32;
+            let min_interval = 0.022f32;
+            let decay = 0.92f32;
             while *repeating.lock().unwrap() {
-                {
-                    let mut enigo = enigo.lock().unwrap();
-                    let _ = enigo.key_down(Key::Raw(vk::BACK));
-                    let _ = enigo.key_up(Key::Raw(vk::BACK));
+                { let mut e = enigo.lock().unwrap();
+                  let _ = e.key(EnigoKey::Backspace, Direction::Press);
+                  let _ = e.key(EnigoKey::Backspace, Direction::Release);
                 }
-                let sleep_ms = (interval * 1000.0) as u64;
-                thread::sleep(Duration::from_millis(sleep_ms));
+                thread::sleep(Duration::from_millis((interval * 1000.0) as u64));
                 interval = (interval * decay).max(min_interval);
             }
         }));
     }
 
-    /// 语音键按下处理：按 voice_mode 发不同组合键
+    /// 语音键按下
     fn handle_voice_key_down(&self, mode: config::VoiceMode) {
         use config::VoiceMode;
-        let mut enigo = self.enigo.lock().unwrap();
+        let mut e = self.enigo.lock().unwrap();
         match mode {
             VoiceMode::WinH => {
-                // Win+H：Windows 语音听写（单次触发，松开不操作）
-                let _ = enigo.key_down(Key::Super);
-                let _ = enigo.key_down(Key::Raw(vk::letter('h')));
-                let _ = enigo.key_up(Key::Raw(vk::letter('h')));
-                let _ = enigo.key_up(Key::Super);
+                let _ = e.key(EnigoKey::Meta, Direction::Press);
+                let _ = e.key(EnigoKey::Unicode('h'), Direction::Press);
+                let _ = e.key(EnigoKey::Unicode('h'), Direction::Release);
+                let _ = e.key(EnigoKey::Meta, Direction::Release);
             }
-            VoiceMode::LeftCtrl => {
-                // 左 Ctrl 按住
-                let _ = enigo.key_down(Key::Control);
-            }
-            VoiceMode::LeftWin => {
-                // 左 Win 按住
-                let _ = enigo.key_down(Key::Super);
-            }
-            VoiceMode::CtrlWin => {
-                // Ctrl+Win 双修饰键同时按住
-                let _ = enigo.key_down(Key::Control);
-                let _ = enigo.key_down(Key::Super);
-            }
-            VoiceMode::WinShift => {
-                // Win+Shift 双修饰键同时按住
-                let _ = enigo.key_down(Key::Super);
-                let _ = enigo.key_down(Key::Shift);
-            }
-            VoiceMode::CtrlShift => {
-                // Ctrl+Shift 双修饰键同时按住
-                let _ = enigo.key_down(Key::Control);
-                let _ = enigo.key_down(Key::Shift);
-            }
+            VoiceMode::LeftCtrl => { let _ = e.key(EnigoKey::Control, Direction::Press); }
+            VoiceMode::LeftWin => { let _ = e.key(EnigoKey::Meta, Direction::Press); }
+            VoiceMode::CtrlWin => { let _ = e.key(EnigoKey::Control, Direction::Press);
+                                     let _ = e.key(EnigoKey::Meta, Direction::Press); }
+            VoiceMode::WinShift => { let _ = e.key(EnigoKey::Meta, Direction::Press);
+                                      let _ = e.key(EnigoKey::Shift, Direction::Press); }
+            VoiceMode::CtrlShift => { let _ = e.key(EnigoKey::Control, Direction::Press);
+                                       let _ = e.key(EnigoKey::Shift, Direction::Press); }
             VoiceMode::AltShift => {
-                // Alt+Shift：单次触发，切换输入语言（Windows 中英文切换）
-                let _ = enigo.key_down(Key::Alt);
-                let _ = enigo.key_down(Key::Shift);
-                let _ = enigo.key_up(Key::Shift);
-                let _ = enigo.key_up(Key::Alt);
+                let _ = e.key(EnigoKey::Alt, Direction::Press);
+                let _ = e.key(EnigoKey::Shift, Direction::Press);
+                let _ = e.key(EnigoKey::Shift, Direction::Release);
+                let _ = e.key(EnigoKey::Alt, Direction::Release);
             }
-            VoiceMode::MicToggle => {
-                // 切换虚拟麦克风转发开关（由 audio 模块处理）
-            }
+            VoiceMode::MicToggle => {}
         }
     }
 
-    /// 语音键松开处理：修饰键模式需要发 key-up
+    /// 语音键松开
     fn handle_voice_key_up(&self, mode: config::VoiceMode) {
         use config::VoiceMode;
-        let mut enigo = self.enigo.lock().unwrap();
+        let mut e = self.enigo.lock().unwrap();
         match mode {
-            VoiceMode::LeftCtrl => {
-                let _ = enigo.key_up(Key::Control);
-            }
-            VoiceMode::LeftWin => {
-                let _ = enigo.key_up(Key::Super);
-            }
-            VoiceMode::CtrlWin => {
-                let _ = enigo.key_up(Key::Super);
-                let _ = enigo.key_up(Key::Control);
-            }
-            VoiceMode::WinShift => {
-                let _ = enigo.key_up(Key::Shift);
-                let _ = enigo.key_up(Key::Super);
-            }
-            VoiceMode::CtrlShift => {
-                let _ = enigo.key_up(Key::Shift);
-                let _ = enigo.key_up(Key::Control);
-            }
-            // WinH 是单次触发，AltShift 是单次触发，MicToggle 是开关——松开不操作
+            VoiceMode::LeftCtrl => { let _ = e.key(EnigoKey::Control, Direction::Release); }
+            VoiceMode::LeftWin => { let _ = e.key(EnigoKey::Meta, Direction::Release); }
+            VoiceMode::CtrlWin => { let _ = e.key(EnigoKey::Meta, Direction::Release);
+                                     let _ = e.key(EnigoKey::Control, Direction::Release); }
+            VoiceMode::WinShift => { let _ = e.key(EnigoKey::Shift, Direction::Release);
+                                      let _ = e.key(EnigoKey::Meta, Direction::Release); }
+            VoiceMode::CtrlShift => { let _ = e.key(EnigoKey::Shift, Direction::Release);
+                                       let _ = e.key(EnigoKey::Control, Direction::Release); }
             _ => {}
         }
     }
 
-    /// 执行特殊动作
+    /// 特殊动作
     fn execute_special(&self, code: u32, down: bool) {
         use crate::config::*;
-        if !down { return; }  // 大部分特殊动作只在按下时触发
-
+        if !down { return; }
         match code {
             SPECIAL_OPEN_NOTEPAD => {
-                // 打开记事本 + Ctrl+N 新建
                 let _ = std::process::Command::new("cmd").args(["/c", "notepad"]).spawn();
                 thread::sleep(Duration::from_millis(500));
-                let mut enigo = self.enigo.lock().unwrap();
-                let _ = enigo.key_down(Key::Control);
-                let _ = enigo.key_down(Key::Raw(vk::letter('n')));
-                let _ = enigo.key_up(Key::Raw(vk::letter('n')));
-                let _ = enigo.key_up(Key::Control);
+                let mut e = self.enigo.lock().unwrap();
+                let _ = e.key(EnigoKey::Control, Direction::Press);
+                let _ = e.key(EnigoKey::Unicode('n'), Direction::Press);
+                let _ = e.key(EnigoKey::Unicode('n'), Direction::Release);
+                let _ = e.key(EnigoKey::Control, Direction::Release);
             }
             SPECIAL_LOCK_SCREEN => {
-                // Windows 锁屏
                 #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("rundll32.exe")
-                        .args(["user32.dll,LockWorkStation"])
-                        .spawn();
-                }
+                { let _ = std::process::Command::new("rundll32.exe")
+                    .args(["user32.dll,LockWorkStation"]).spawn(); }
             }
             SPECIAL_SHUTDOWN_CONFIRM => {
-                // 关机确认框（用 MessageBox 模拟）
                 #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("shutdown")
-                        .args(["/s", "/t", "30"])  // 30秒延迟，可取消
-                        .spawn();
-                }
+                { let _ = std::process::Command::new("shutdown")
+                    .args(["/s", "/t", "30"]).spawn(); }
             }
             SPECIAL_INTERRUPT => {
-                // Ctrl+C
-                let mut enigo = self.enigo.lock().unwrap();
-                let _ = enigo.key_down(Key::Control);
-                let _ = enigo.key_down(Key::Raw(vk::letter('c')));
-                let _ = enigo.key_up(Key::Raw(vk::letter('c')));
-                let _ = enigo.key_up(Key::Control);
+                let mut e = self.enigo.lock().unwrap();
+                let _ = e.key(EnigoKey::Control, Direction::Press);
+                let _ = e.key(EnigoKey::Unicode('c'), Direction::Press);
+                let _ = e.key(EnigoKey::Unicode('c'), Direction::Release);
+                let _ = e.key(EnigoKey::Control, Direction::Release);
             }
             SPECIAL_SHOW_DESKTOP => {
-                // Win+D 显示桌面
-                let mut enigo = self.enigo.lock().unwrap();
-                let _ = enigo.key_down(Key::Super);
-                let _ = enigo.key_down(Key::Raw(vk::letter('d')));
-                let _ = enigo.key_up(Key::Raw(vk::letter('d')));
-                let _ = enigo.key_up(Key::Super);
+                let mut e = self.enigo.lock().unwrap();
+                let _ = e.key(EnigoKey::Meta, Direction::Press);
+                let _ = e.key(EnigoKey::Unicode('d'), Direction::Press);
+                let _ = e.key(EnigoKey::Unicode('d'), Direction::Release);
+                let _ = e.key(EnigoKey::Meta, Direction::Release);
             }
-            // 鼠标/滚轮动作需要持续状态（down/up 配对），简化版先不做持续移动
             SPECIAL_MOUSE_CLICK => {
-                let mut enigo = self.enigo.lock().unwrap();
-                let _ = enigo.mouse_click(MouseButton::Left);
+                let mut e = self.enigo.lock().unwrap();
+                let _ = e.button(MouseButton::Left, Direction::Click);
             }
             SPECIAL_MOUSE_RCLICK => {
-                let mut enigo = self.enigo.lock().unwrap();
-                let _ = enigo.mouse_click(MouseButton::Right);
+                let mut e = self.enigo.lock().unwrap();
+                let _ = e.button(MouseButton::Right, Direction::Click);
             }
             SPECIAL_SCROLL_UP => {
-                let mut enigo = self.enigo.lock().unwrap();
-                enigo.mouse_scroll_y(2);
+                let mut e = self.enigo.lock().unwrap();
+                let _ = e.scroll(2, Axis::Vertical);
             }
             SPECIAL_SCROLL_DOWN => {
-                let mut enigo = self.enigo.lock().unwrap();
-                enigo.mouse_scroll_y(-2);
+                let mut e = self.enigo.lock().unwrap();
+                let _ = e.scroll(-2, Axis::Vertical);
             }
             _ => {}
         }
