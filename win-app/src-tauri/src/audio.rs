@@ -2,7 +2,7 @@
 // 16kHz mono Float32，和 Mac 版完全一致，无需重采样。
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SampleRate, Stream, StreamConfig};
+use cpal::{SampleFormat, SampleRate, Stream};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +50,8 @@ impl AudioRing {
 /// 音频输出：cpal stream → VB-Cable（或默认输出设备）
 pub struct AudioOut {
     pub ring: Arc<AudioRing>,
+    pub device_name: String,
+    pub using_vbcable: bool,
     _stream: Stream, // 保持 stream 存活（drop 会停止输出）
 }
 
@@ -59,10 +61,11 @@ impl AudioOut {
         let ring = Arc::new(AudioRing::new());
         let ring_clone = ring.clone();
 
-        let mut host = cpal::default_host();
+        let host = cpal::default_host();
 
         // 尝试找 VB-Cable
-        let device = host.output_devices()
+        let device = host
+            .output_devices()
             .map_err(|e| format!("枚举输出设备失败: {}", e))?
             .find(|d| {
                 d.name()
@@ -74,24 +77,29 @@ impl AudioOut {
         let device = device.ok_or("找不到输出设备")?;
 
         let device_name = device.name().unwrap_or_default();
-        log::info!("音频输出设备: {}", device_name);
+        let using_vbcable = device_name.contains("CABLE Input") || device_name.contains("VB-Audio");
+        log::info!(
+            "音频输出设备: {} (VB-Cable: {})",
+            device_name,
+            using_vbcable
+        );
 
         let supported_config = device
             .supported_output_configs()
             .map_err(|e| format!("查询设备配置失败: {}", e))?
-            .find(|c| c.channels() == 1 && c.sample_format() == SampleFormat::F32)
-            .or_else(|| {
-                // 设备不支持单声道 F32，用默认配置
-                device.supported_output_configs().ok()?.next()
+            .find(|c| {
+                c.channels() == 1
+                    && c.sample_format() == SampleFormat::F32
+                    && c.min_sample_rate() <= SampleRate(16000)
+                    && c.max_sample_rate() >= SampleRate(16000)
             })
-            .ok_or("设备不支持所需音频配置")?;
+            .ok_or("输出设备不支持 16kHz 单声道 Float32；请在 VB-CABLE 声音设置中启用此格式")?;
 
-        // 固定 16kHz（和 ADPCM 解码输出一致）
-        let config = StreamConfig {
-            channels: 1,
-            sample_rate: SampleRate(16000),
-            buffer_size: cpal::BufferSize::Default,
-        };
+        // 固定 16kHz（和 ADPCM 解码输出一致），但从已验证的设备配置派生，
+        // 防止 CI 或实际设备在不支持的格式下创建 stream。
+        let config = supported_config
+            .with_sample_rate(SampleRate(16000))
+            .config();
 
         let stream = device
             .build_output_stream(
@@ -114,13 +122,15 @@ impl AudioOut {
 
         Ok(AudioOut {
             ring,
+            device_name,
+            using_vbcable,
             _stream: stream,
         })
     }
 
     /// 是否检测到 VB-Cable
     pub fn vbcable_found() -> bool {
-        let mut host = cpal::default_host();
+        let host = cpal::default_host();
         if let Ok(mut devices) = host.output_devices() {
             return devices.any(|d| {
                 d.name()
