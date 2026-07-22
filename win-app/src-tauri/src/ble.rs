@@ -5,10 +5,8 @@
 use crate::adpcm::AdpcmDecoder;
 use crate::audio::AudioRing;
 use crate::dsp::VoiceDsp;
-use btleplug::api::{
-    Central, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
-};
-use btleplug::platform::{Adapter, Manager, Peripheral};
+use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::platform::Manager;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -22,6 +20,9 @@ const UUID_CTL: Uuid = Uuid::from_u128(0xAB5E0004_5A21_4F05_BC7D_AF01F617B664);
 
 // GET_CAPS 握手字节
 const GET_CAPS: &[u8] = &[0x0A, 0x00, 0x06, 0x00, 0x01];
+
+/// 语音任务会在独立 Tokio 线程中运行，日志回调也必须能安全跨线程共享。
+type VoiceLog = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// BLE 语音传输器
 pub struct BleVoice {
@@ -42,14 +43,10 @@ impl BleVoice {
     }
 
     /// 启动 BLE 语音监听（异步，需在 tokio runtime 中运行）
-    pub async fn run(
-        &self,
-        ring: Arc<AudioRing>,
-        log: impl Fn(&str) + Send + 'static,
-    ) {
+    pub async fn run(&self, ring: Arc<AudioRing>, log: VoiceLog) {
         loop {
             log("BLE 语音：初始化蓝牙适配器…");
-            match self.connect_and_stream(ring.clone(), &log).await {
+            match self.connect_and_stream(ring.clone(), log.clone()).await {
                 Ok(()) => {
                     log("BLE 语音：连接结束，3 秒后重试");
                 }
@@ -61,11 +58,7 @@ impl BleVoice {
         }
     }
 
-    async fn connect_and_stream(
-        &self,
-        ring: Arc<AudioRing>,
-        log: &impl Fn(&str),
-    ) -> Result<(), String> {
+    async fn connect_and_stream(&self, ring: Arc<AudioRing>, log: VoiceLog) -> Result<(), String> {
         // 1. 获取蓝牙适配器
         let manager = Manager::new()
             .await
@@ -74,10 +67,7 @@ impl BleVoice {
             .adapters()
             .await
             .map_err(|e| format!("枚举适配器失败: {}", e))?;
-        let adapter = adapters
-            .into_iter()
-            .next()
-            .ok_or("没有找到蓝牙适配器")?;
+        let adapter = adapters.into_iter().next().ok_or("没有找到蓝牙适配器")?;
 
         // 2. 扫描 BLE 设备（无过滤，因为 Windows 广播名常缺失）
         log("BLE 语音：正在扫描 BLE 设备…");
@@ -187,7 +177,14 @@ impl BleVoice {
             if notification.uuid == UUID_RX {
                 // 音频帧
                 if self.streaming.load(Ordering::Relaxed) {
-                    self.packet_count.fetch_add(1, Ordering::Relaxed);
+                    let packet_index = self.packet_count.fetch_add(1, Ordering::Relaxed);
+                    if packet_index == 0 {
+                        log(&format!(
+                            "🎤 收到首个音频帧：{} bytes，虚拟麦克风转发={}",
+                            notification.value.len(),
+                            self.mic_streaming.load(Ordering::Relaxed)
+                        ));
+                    }
                     let pcm = codec.decode(&notification.value);
                     let enhanced = dsp.process(&pcm);
                     if self.mic_streaming.load(Ordering::Relaxed) {
@@ -212,16 +209,22 @@ impl BleVoice {
                             let peripheral_clone = peripheral.clone();
                             let packet_count_clone = self.packet_count.clone();
                             let streaming_clone = self.streaming.clone();
-                            let log_clone = log; // 简化：闭包不捕获 log
+                            let log_clone = log.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_millis(1200)).await;
                                 if streaming_clone.load(Ordering::Relaxed)
                                     && packet_count_clone.load(Ordering::Relaxed) == 0
                                 {
-                                    let _ = peripheral_clone
+                                    match peripheral_clone
                                         .write(&tx_clone, GET_CAPS, WriteType::WithResponse)
-                                        .await;
-                                    log_clone("⚠️ 1.2s 无音频帧，已重发 GET_CAPS");
+                                        .await
+                                    {
+                                        Ok(()) => log_clone("⚠️ 1.2s 无音频帧，已重发 GET_CAPS"),
+                                        Err(error) => log_clone(&format!(
+                                            "❌ 1.2s 无音频帧，重发 GET_CAPS 失败: {}",
+                                            error
+                                        )),
+                                    }
                                 }
                             });
                         }
@@ -230,7 +233,6 @@ impl BleVoice {
                             log("语音键松开，等待尾音包…");
                             let streaming = self.streaming.clone();
                             let mic_streaming = self.mic_streaming.clone();
-                            let ring_clone = ring.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_millis(300)).await;
                                 streaming.store(false, Ordering::Relaxed);
