@@ -62,8 +62,7 @@ impl AudioOut {
         let host = cpal::default_host();
 
         // 尝试找 VB-Cable
-        let device = host
-            .output_devices()
+        let device = host.output_devices()
             .map_err(|e| format!("枚举输出设备失败: {}", e))?
             .find(|d| {
                 d.name()
@@ -97,7 +96,7 @@ impl AudioOut {
         let stream = device
             .build_output_stream(
                 &config,
-                move |output: &mut [f32], _: &cpal::OutputCallbackTimeInfo| {
+                move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     // 从 ring buffer 取数据，不足补零
                     let samples = ring_clone.pop(output.len());
                     output.copy_from_slice(&samples);
