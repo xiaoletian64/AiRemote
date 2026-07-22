@@ -59,7 +59,7 @@ impl AudioOut {
         let ring = Arc::new(AudioRing::new());
         let ring_clone = ring.clone();
 
-        let host = cpal::default_host();
+        let mut host = cpal::default_host();
 
         // 尝试找 VB-Cable
         let device = host.output_devices()
@@ -120,7 +120,8 @@ impl AudioOut {
 
     /// 是否检测到 VB-Cable
     pub fn vbcable_found() -> bool {
-        if let Ok(host) = cpal::default_host().output_devices() {
+        let mut host = cpal::default_host();
+        if let Ok(mut devices) = host.output_devices() {
             return host.any(|d| {
                 d.name()
                     .map(|n| n.contains("CABLE Input") || n.contains("VB-Audio"))
