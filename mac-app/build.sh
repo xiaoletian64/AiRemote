@@ -90,15 +90,16 @@ if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
         | sed -n 's/.*"\(.*\)"$/\1/p' | head -1)
 fi
+ENTITLEMENTS="Resources/entitlements.plist"
 if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
     echo "→ 使用 Developer ID（可用于后续公证）: $SIGN_IDENTITY"
-    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+    codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP"
 elif [ -n "$SIGN_IDENTITY" ]; then
     echo "→ 使用稳定本机签名（身份固定，授权一次永久有效）: $SIGN_IDENTITY"
-    codesign --force --sign "$SIGN_IDENTITY" "$APP"
+    codesign --force --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP"
 else
     echo "→ 未找到任何签名证书，回退 ad-hoc 签名（每次重建身份会变，授权可能失效）"
-    codesign --force --sign - "$APP"
+    codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP"
 fi
 
 # 也生成 zip（兼容性备用）
