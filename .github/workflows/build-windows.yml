@@ -27,7 +27,7 @@ jobs:
 
       - name: Build Windows EXE
         working-directory: win-app/src-tauri
-        run: cargo tauri build --target x86_64-pc-windows-msvc
+        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
@@ -35,6 +35,4 @@ jobs:
           name: 小米超级键盘-Windows
           path: |
             win-app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-            win-app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
-            win-app/src-tauri/target/x86_64-pc-windows-msvc/release/*.exe
-          if-no-files-found: ignore
+          if-no-files-found: error
