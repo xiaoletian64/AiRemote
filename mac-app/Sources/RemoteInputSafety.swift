@@ -19,8 +19,8 @@ enum RemoteInputGuard {
     static let deleteUsage: UInt8 = 0x35
     /// Home 在圆盘噪声中出现过，只允许明确的长按动作。
     static let homeLongPressDuration: TimeInterval = 3.0
-    /// OK 在圆盘噪声中出现过，只允许明确的长按确认。
-    static let confirmLongPressDuration: TimeInterval = 2.0
+    /// OK 在圆盘噪声中出现过；100ms 足以跨过短促噪声，同时正常单击无需等待两秒。
+    static let confirmLongPressDuration: TimeInterval = 0.10
     /// Menu 也不接受短脉冲，只允许明确的长按映射。
     static let menuLongPressDuration: TimeInterval = 2.0
     /// 方向键必须保持 80ms：低于用户实测最短自然按压 91ms，同时过滤短促噪声。
