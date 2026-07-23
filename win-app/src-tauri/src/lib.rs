@@ -7,11 +7,16 @@ mod diagnostics;
 mod dsp;
 mod hid;
 mod mapping;
+#[cfg(windows)]
+mod raw_input;
+mod voice_keys;
 
 use config::{Config, VoiceMode};
 use diagnostics::Diagnostics;
 use hid::HidListener;
 use mapping::KeyMapper;
+#[cfg(windows)]
+use raw_input::RawInputListener;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
@@ -23,6 +28,8 @@ struct AppState {
     hid: Arc<Mutex<Option<HidListener>>>,
     connected: Arc<Mutex<bool>>,
     log: Diagnostics,
+    #[cfg(windows)]
+    raw_input: RawInputListener,
 }
 
 /// 日志辅助
@@ -101,6 +108,7 @@ fn rescan(state: State<AppState>) -> Vec<String> {
             for device in &devices {
                 log_msg(&state, format!("重新扫描结果：{}", device));
             }
+
             devices
         }
         Err(error) => {
@@ -215,6 +223,29 @@ pub fn run() {
                 });
             }
 
+            // RC003 的键盘 HID 可能被 Windows 独占，hidapi 无法读取；Raw Input
+            // 仍可收到系统分发的 F5/usage 0x3E 语音键，不影响普通键盘。
+            #[cfg(windows)]
+            let raw_input = {
+                let km = key_mapper.clone();
+                let log_clone = log.clone();
+                RawInputListener::start(Arc::new(move |usage, is_down| {
+                    diagnostics::record(
+                        &log_clone,
+                        format!(
+                            "Raw Input 语音键：{} (usage=0x{:02X})",
+                            if is_down { "按下" } else { "松开" },
+                            usage
+                        ),
+                    );
+                    if is_down {
+                        km.lock().unwrap().on_key_down(usage);
+                    } else {
+                        km.lock().unwrap().on_key_up(usage);
+                    }
+                }))
+            };
+
             // 启动 BLE 语音 + 音频输出
             // 音频：初始化 ring buffer + cpal 输出（VB-Cable 或默认设备）
             let audio_out = match audio::AudioOut::new() {
@@ -231,10 +262,13 @@ pub fn run() {
                             }
                         ),
                     );
-                    diagnostics::record(&log, format!(
-                        "音频格式：{}Hz / {} 声道（源音频：16000Hz / 1 声道，已自动转换）",
-                        ao.sample_rate, ao.channels
-                    ));
+                    diagnostics::record(
+                        &log,
+                        format!(
+                            "音频格式：{}Hz / {} 声道（源音频：16000Hz / 1 声道，已自动转换）",
+                            ao.sample_rate, ao.channels
+                        ),
+                    );
                     Some(ao)
                 }
                 Err(e) => {
@@ -289,6 +323,8 @@ pub fn run() {
                 hid: Arc::new(Mutex::new(Some(hid))),
                 connected,
                 log,
+                #[cfg(windows)]
+                raw_input,
             };
 
             app.manage(state);

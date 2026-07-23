@@ -1,9 +1,12 @@
 // mapping.rs — 按键映射 + 合成事件 + 特殊动作（移植自 Mac 版 Engine.swift）
 use crate::config::{self, vk, ButtonMapping, Config, SPECIAL_BASE};
-use enigo::{Axis, Button as MouseButton, Direction, Enigo, Key as EnigoKey, Keyboard, Mouse, Settings};
+use crate::voice_keys::{events as voice_key_events, VoiceKeyEvent, VoiceKeyMode};
+use enigo::{
+    Axis, Button as MouseButton, Direction, Enigo, Key as EnigoKey, Keyboard, Mouse, Settings,
+};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 /// Windows VK code → enigo Key 枚举。
 /// 关键修复：不能用 enigo.raw()（它期望 scancode 而非 VK code）。
@@ -25,9 +28,7 @@ fn vk_to_enigo_key(vk_code: u16) -> Option<EnigoKey> {
         vk::PRIOR => Some(EnigoKey::PageUp),
         vk::NEXT => Some(EnigoKey::PageDown),
         // 字母/数字用 Unicode（enigo 会自动转 scancode）
-        c if (0x30..=0x5A).contains(&c) => {
-            char::from_u32(c as u32).map(EnigoKey::Unicode)
-        }
+        c if (0x30..=0x5A).contains(&c) => char::from_u32(c as u32).map(EnigoKey::Unicode),
         _ => None,
     }
 }
@@ -36,6 +37,36 @@ fn vk_to_enigo_key(vk_code: u16) -> Option<EnigoKey> {
 fn send_vk(enigo: &mut Enigo, vk_code: u16, direction: Direction) {
     if let Some(key) = vk_to_enigo_key(vk_code) {
         let _ = enigo.key(key, direction);
+    }
+}
+
+fn voice_key_mode(mode: config::VoiceMode) -> VoiceKeyMode {
+    use config::VoiceMode;
+    match mode {
+        VoiceMode::WinH => VoiceKeyMode::WinH,
+        VoiceMode::LeftCtrl => VoiceKeyMode::LeftCtrl,
+        VoiceMode::LeftWin => VoiceKeyMode::LeftWin,
+        VoiceMode::CtrlWin => VoiceKeyMode::CtrlWin,
+        VoiceMode::WinShift => VoiceKeyMode::WinShift,
+        VoiceMode::CtrlShift => VoiceKeyMode::CtrlShift,
+        VoiceMode::AltShift => VoiceKeyMode::AltShift,
+        VoiceMode::MicToggle => VoiceKeyMode::MicToggle,
+    }
+}
+
+fn emit_voice_key_event(enigo: &mut Enigo, event: VoiceKeyEvent) -> Result<(), enigo::InputError> {
+    use VoiceKeyEvent::*;
+    match event {
+        ControlDown => enigo.key(EnigoKey::Control, Direction::Press),
+        ControlUp => enigo.key(EnigoKey::Control, Direction::Release),
+        MetaDown => enigo.key(EnigoKey::Meta, Direction::Press),
+        MetaUp => enigo.key(EnigoKey::Meta, Direction::Release),
+        ShiftDown => enigo.key(EnigoKey::Shift, Direction::Press),
+        ShiftUp => enigo.key(EnigoKey::Shift, Direction::Release),
+        AltDown => enigo.key(EnigoKey::Alt, Direction::Press),
+        AltUp => enigo.key(EnigoKey::Alt, Direction::Release),
+        HDown => enigo.key(EnigoKey::Unicode('h'), Direction::Press),
+        HUp => enigo.key(EnigoKey::Unicode('h'), Direction::Release),
     }
 }
 
@@ -67,11 +98,20 @@ impl KeyMapper {
             return;
         }
         let cfg = self.config.lock().unwrap();
-        let mapping = match cfg.find_mapping(usage) { Some(m) => m.clone(), None => return };
+        let mapping = match cfg.find_mapping(usage) {
+            Some(m) => m.clone(),
+            None => return,
+        };
         drop(cfg);
 
-        if mapping.special >= SPECIAL_BASE { self.execute_special(mapping.special, true); return; }
-        if usage == 0xF1 && mapping.vk == vk::BACK { self.start_delete_repeat(); return; }
+        if mapping.special >= SPECIAL_BASE {
+            self.execute_special(mapping.special, true);
+            return;
+        }
+        if usage == 0xF1 && mapping.vk == vk::BACK {
+            self.start_delete_repeat();
+            return;
+        }
         if mapping.vk != config::VK_NONE {
             let mut enigo = self.enigo.lock().unwrap();
             send_vk(&mut enigo, mapping.vk, Direction::Press);
@@ -86,11 +126,19 @@ impl KeyMapper {
             return;
         }
         let cfg = self.config.lock().unwrap();
-        let mapping = match cfg.find_mapping(usage) { Some(m) => m.clone(), None => return };
+        let mapping = match cfg.find_mapping(usage) {
+            Some(m) => m.clone(),
+            None => return,
+        };
         drop(cfg);
 
-        if usage == 0xF1 { *self.delete_repeating.lock().unwrap() = false; }
-        if mapping.special >= SPECIAL_BASE { self.execute_special(mapping.special, false); return; }
+        if usage == 0xF1 {
+            *self.delete_repeating.lock().unwrap() = false;
+        }
+        if mapping.special >= SPECIAL_BASE {
+            self.execute_special(mapping.special, false);
+            return;
+        }
         if mapping.vk != config::VK_NONE {
             let mut enigo = self.enigo.lock().unwrap();
             send_vk(&mut enigo, mapping.vk, Direction::Release);
@@ -101,7 +149,9 @@ impl KeyMapper {
     fn start_delete_repeat(&mut self) {
         // 先停掉之前的线程（防止累积多次删除）
         *self.delete_repeating.lock().unwrap() = false;
-        if let Some(handle) = self.delete_thread_handle.take() { let _ = handle.join(); }
+        if let Some(handle) = self.delete_thread_handle.take() {
+            let _ = handle.join();
+        }
         *self.delete_repeating.lock().unwrap() = true;
         let repeating = self.delete_repeating.clone();
         let enigo = self.enigo.clone();
@@ -112,9 +162,10 @@ impl KeyMapper {
             let min_interval = 0.022f32;
             let decay = 0.92f32;
             while *repeating.lock().unwrap() {
-                { let mut e = enigo.lock().unwrap();
-                  let _ = e.key(EnigoKey::Backspace, Direction::Press);
-                  let _ = e.key(EnigoKey::Backspace, Direction::Release);
+                {
+                    let mut e = enigo.lock().unwrap();
+                    let _ = e.key(EnigoKey::Backspace, Direction::Press);
+                    let _ = e.key(EnigoKey::Backspace, Direction::Release);
                 }
                 thread::sleep(Duration::from_millis((interval * 1000.0) as u64));
                 interval = (interval * decay).max(min_interval);
@@ -124,57 +175,35 @@ impl KeyMapper {
 
     /// 语音键按下
     fn handle_voice_key_down(&self, mode: config::VoiceMode) {
-        use config::VoiceMode;
         let mut e = self.enigo.lock().unwrap();
-        match mode {
-            VoiceMode::WinH => {
-                let _ = e.key(EnigoKey::Meta, Direction::Press);
-                let _ = e.key(EnigoKey::Unicode('h'), Direction::Press);
-                let _ = e.key(EnigoKey::Unicode('h'), Direction::Release);
-                let _ = e.key(EnigoKey::Meta, Direction::Release);
+        for event in voice_key_events(voice_key_mode(mode), true) {
+            if let Err(error) = emit_voice_key_event(&mut e, event) {
+                eprintln!("语音键事件 {:?} 注入失败: {}", event, error);
             }
-            VoiceMode::LeftCtrl => { let _ = e.key(EnigoKey::Control, Direction::Press); }
-            VoiceMode::LeftWin => { let _ = e.key(EnigoKey::Meta, Direction::Press); }
-            VoiceMode::CtrlWin => { let _ = e.key(EnigoKey::Control, Direction::Press);
-                                     let _ = e.key(EnigoKey::Meta, Direction::Press); }
-            VoiceMode::WinShift => { let _ = e.key(EnigoKey::Meta, Direction::Press);
-                                      let _ = e.key(EnigoKey::Shift, Direction::Press); }
-            VoiceMode::CtrlShift => { let _ = e.key(EnigoKey::Control, Direction::Press);
-                                       let _ = e.key(EnigoKey::Shift, Direction::Press); }
-            VoiceMode::AltShift => {
-                let _ = e.key(EnigoKey::Alt, Direction::Press);
-                let _ = e.key(EnigoKey::Shift, Direction::Press);
-                let _ = e.key(EnigoKey::Shift, Direction::Release);
-                let _ = e.key(EnigoKey::Alt, Direction::Release);
-            }
-            VoiceMode::MicToggle => {}
         }
     }
 
     /// 语音键松开
     fn handle_voice_key_up(&self, mode: config::VoiceMode) {
-        use config::VoiceMode;
         let mut e = self.enigo.lock().unwrap();
-        match mode {
-            VoiceMode::LeftCtrl => { let _ = e.key(EnigoKey::Control, Direction::Release); }
-            VoiceMode::LeftWin => { let _ = e.key(EnigoKey::Meta, Direction::Release); }
-            VoiceMode::CtrlWin => { let _ = e.key(EnigoKey::Meta, Direction::Release);
-                                     let _ = e.key(EnigoKey::Control, Direction::Release); }
-            VoiceMode::WinShift => { let _ = e.key(EnigoKey::Shift, Direction::Release);
-                                      let _ = e.key(EnigoKey::Meta, Direction::Release); }
-            VoiceMode::CtrlShift => { let _ = e.key(EnigoKey::Shift, Direction::Release);
-                                       let _ = e.key(EnigoKey::Control, Direction::Release); }
-            _ => {}
+        for event in voice_key_events(voice_key_mode(mode), false) {
+            if let Err(error) = emit_voice_key_event(&mut e, event) {
+                eprintln!("语音键事件 {:?} 注入失败: {}", event, error);
+            }
         }
     }
 
     /// 特殊动作
     fn execute_special(&self, code: u32, down: bool) {
         use crate::config::*;
-        if !down { return; }
+        if !down {
+            return;
+        }
         match code {
             SPECIAL_OPEN_NOTEPAD => {
-                let _ = std::process::Command::new("cmd").args(["/c", "notepad"]).spawn();
+                let _ = std::process::Command::new("cmd")
+                    .args(["/c", "notepad"])
+                    .spawn();
                 thread::sleep(Duration::from_millis(500));
                 let mut e = self.enigo.lock().unwrap();
                 let _ = e.key(EnigoKey::Control, Direction::Press);
@@ -184,13 +213,19 @@ impl KeyMapper {
             }
             SPECIAL_LOCK_SCREEN => {
                 #[cfg(target_os = "windows")]
-                { let _ = std::process::Command::new("rundll32.exe")
-                    .args(["user32.dll,LockWorkStation"]).spawn(); }
+                {
+                    let _ = std::process::Command::new("rundll32.exe")
+                        .args(["user32.dll,LockWorkStation"])
+                        .spawn();
+                }
             }
             SPECIAL_SHUTDOWN_CONFIRM => {
                 #[cfg(target_os = "windows")]
-                { let _ = std::process::Command::new("shutdown")
-                    .args(["/s", "/t", "30"]).spawn(); }
+                {
+                    let _ = std::process::Command::new("shutdown")
+                        .args(["/s", "/t", "30"])
+                        .spawn();
+                }
             }
             SPECIAL_INTERRUPT => {
                 let mut e = self.enigo.lock().unwrap();

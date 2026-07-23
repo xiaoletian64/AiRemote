@@ -102,6 +102,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-log",
  "tokio",
+ "tokio-stream",
+ "uuid",
  "windows 0.58.0",
 ]
 
