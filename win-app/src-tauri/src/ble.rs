@@ -5,7 +5,7 @@
 use crate::adpcm::AdpcmDecoder;
 use crate::audio::AudioRing;
 use crate::dsp::VoiceDsp;
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::api::{Central, Manager as _, Peripheral, ScanFilter, WriteType};
 use btleplug::platform::Manager;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -107,6 +107,9 @@ impl BleVoice {
         .map_err(|_| "30 秒内未发现 ATVV 设备".to_string())?;
 
         log("BLE 语音：发现设备，正在连接…");
+
+        #[cfg(windows)]
+        ensure_windows_pairing(&peripheral, &log).await?;
 
         // 4. 连接
         peripheral
@@ -251,4 +254,48 @@ impl BleVoice {
         log("BLE 语音：通知流结束（设备断开）");
         Ok(())
     }
+}
+
+#[cfg(windows)]
+async fn ensure_windows_pairing<P: Peripheral>(
+    peripheral: &P,
+    log: &VoiceLog,
+) -> Result<(), String> {
+    use windows::Devices::Bluetooth::BluetoothLEDevice;
+    use windows::Devices::Enumeration::DevicePairingResultStatus;
+
+    let address: u64 = peripheral.address().into();
+    let device = BluetoothLEDevice::FromBluetoothAddressAsync(address)
+        .map_err(|e| format!("初始化 Windows BLE 设备失败: {e}"))?
+        .get()
+        .map_err(|e| format!("打开 Windows BLE 设备失败: {e}"))?;
+    let info = device
+        .DeviceInformation()
+        .map_err(|e| format!("读取 Windows BLE 配对信息失败: {e}"))?;
+    let pairing = info
+        .Pairing()
+        .map_err(|e| format!("读取 Windows BLE 配对能力失败: {e}"))?;
+    if pairing.IsPaired().unwrap_or(false) {
+        return Ok(());
+    }
+    if !pairing.CanPair().unwrap_or(false) {
+        return Err("Windows 要求 BLE 配对，但设备当前不可配对".to_string());
+    }
+
+    log("BLE 语音：特征需要认证，正在请求 Windows 配对…");
+    let result = pairing
+        .PairAsync()
+        .map_err(|e| format!("发起 Windows BLE 配对失败: {e}"))?
+        .get()
+        .map_err(|e| format!("Windows BLE 配对失败: {e}"))?;
+    let status = result
+        .Status()
+        .map_err(|e| format!("读取 Windows BLE 配对结果失败: {e}"))?;
+    if status != DevicePairingResultStatus::Paired
+        && status != DevicePairingResultStatus::AlreadyPaired
+    {
+        return Err(format!("Windows BLE 配对未完成: {status:?}"));
+    }
+    log("BLE 语音：Windows 配对完成，继续订阅语音特征");
+    Ok(())
 }
