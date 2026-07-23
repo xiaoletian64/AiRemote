@@ -35,8 +35,8 @@ struct RemoteInputSafetyTests {
                "Delete must be assigned to the proven-safe TV key, never Back or OK")
         expect(RemoteInputGuard.homeLongPressDuration == 3.0,
                "Home must require a three-second hold before opening Notes")
-        expect(RemoteInputGuard.confirmLongPressDuration == 2.0,
-               "OK must require a two-second hold before sending confirmation")
+        expect(RemoteInputGuard.confirmLongPressDuration == 0.10,
+               "OK must require a 100ms hold before sending confirmation")
         expect(RemoteInputGuard.menuLongPressDuration == 2.0,
                "Menu must require a two-second hold before sending its mapping")
         expect(RemoteInputGuard.directionHoldDuration == 0.08,

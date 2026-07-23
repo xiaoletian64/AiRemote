@@ -1770,7 +1770,7 @@ final class Engine: ObservableObject {
             return
         }
         if Int(usage) == 0x28 {
-            // OK 只有持续 2 秒才发一次当前映射（默认 Return）；短按/噪声不产生任何动作。
+            // OK 保持 100ms 确认：过滤短促圆盘噪声，正常单击也不会有明显延迟。
             var gatedMapping = m
             gatedMapping.keycode = KeyNames.kNone
             gatedMapping.longPressKeycode = m.keycode
@@ -2178,11 +2178,13 @@ final class Engine: ObservableObject {
         }
     }
 
-    // ---------- 系统音量（CoreAudio 合成，不依赖系统收到 HID 事件）----------
+    // ---------- 系统音量 ----------
     /// 遥控器音量键(0x80/0x81) 的原始 HID 事件被 VoiceGlobeMapper 在内核层映射成
     /// No-Event 吞掉，系统收不到 → 无法走原生音量 HUD。App 在 value callback
     /// （内核映射之前）能读到原始 usage，触发本方法用 CoreAudio 直接调系统默认
-    /// 输出设备的音量。步长 1/16（约 6.25%），按住通过 specialTimer 连续调节。
+    /// 输出设备的音量。原先直接写 CoreAudio 虽会改变音量，却绕过了系统的音量 HUD。
+    /// 先合成与 Mac 音量键相同的系统媒体事件，让 macOS 负责调音量并显示浮层；
+    /// 如果事件无法投递，再回退到 CoreAudio，保证遥控器不会失去调音量能力。
     private static func defaultOutputDevice() -> AudioDeviceID? {
         var device: AudioDeviceID = 0
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
@@ -2197,6 +2199,7 @@ final class Engine: ObservableObject {
     /// 调系统默认输出设备音量。step ∈ {-1, +1}；读当前音量 → 加减 1/16 → 钳制 [0,1] → 写回。
     /// 没有音量属性（HDMI/DisplayLink 等数字输出）时静默跳过，不刷屏。
     private func adjustSystemVolume(step: Int) {
+        if postNativeVolumeKey(step: step) { return }
         guard let dev = Self.defaultOutputDevice() else { return }
         var vol: Float32 = 0
         var size = UInt32(MemoryLayout<Float32>.size)
@@ -2226,6 +2229,30 @@ final class Engine: ObservableObject {
                 _ = AudioObjectSetPropertyData(dev, &addr2, 0, nil, size, &vol)
             }
         }
+    }
+
+    /// macOS 音量键走的是 subtype=8 的 system-defined media-key 事件，而非普通键盘事件。
+    /// key type 0/1 分别对应音量加/减；发完整 down/up 才能得到系统原生 HUD 与步长策略。
+    @discardableResult
+    private func postNativeVolumeKey(step: Int) -> Bool {
+        let keyType = step > 0 ? 0 : 1
+        let mediaKeyFlags = NSEvent.ModifierFlags(rawValue: 0xA00)
+        for keyState in [0xA, 0xB] { // NX_KEYDOWN / NX_KEYUP
+            guard let event = NSEvent.otherEvent(
+                with: .systemDefined,
+                location: .zero,
+                modifierFlags: mediaKeyFlags,
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: 0,
+                context: nil,
+                subtype: 8,
+                data1: (keyType << 16) | (keyState << 8),
+                data2: -1
+            ), let cgEvent = event.cgEvent else { return false }
+            cgEvent.post(tap: .cghidEventTap)
+        }
+        L("🔊 已发送原生系统音量\(step > 0 ? "+" : "−")事件")
+        return true
     }
 
     // ---------- synthesize keys ----------
