@@ -244,7 +244,7 @@ struct Config: Codable {
         0x4F:(0x7C,false,false,false,false),  // →
         0x28:(0x24,false,false,false,false),  // OK → Enter
         0xF1:(KeyNames.kNone,false,false,false,false),  // Back → 保持原键（交给系统透传，不主动删除，避免自发误删）
-        0x4A:(KeyNames.kOpenNotes,false,false,false,false),   // Home → 打开备忘录
+        0x4A:(KeyNames.kNone,false,false,false,false),         // Home → 仅长按 3 秒打开备忘录
         0x65:(0x35,false,false,false,false),  // Menu → Esc
         0x66:(KeyNames.kLockScreen,false,false,false,false), // Power → 仅锁屏
         0x80:(KeyNames.kVolumeUp,false,false,false,false),   // 音量 + → CoreAudio 调系统音量
@@ -257,9 +257,13 @@ struct Config: Codable {
     static var defaultConfig: Config {
         let btns = known.map { k -> ButtonMapping in
             if let t = defaultTarget[k.usage] {
+                let longPress: Int?
+                if k.usage == 0x4A { longPress = KeyNames.kOpenNotes }
+                else if k.usage == 0x66 { longPress = KeyNames.kShutdownConfirm }
+                else if k.usage == 0x65 { longPress = KeyNames.kInterrupt }
+                else { longPress = nil }
                 return ButtonMapping(usage: k.usage, name: k.name, keycode: t.0, cmd: t.1, shift: t.2, opt: t.3, ctrl: t.4,
-                                     longPressKeycode: k.usage == 0x66 ? KeyNames.kShutdownConfirm
-                                                : (k.usage == 0x65 ? KeyNames.kInterrupt : nil))
+                                     longPressKeycode: longPress)
             }
             return ButtonMapping(usage: k.usage, name: k.name)
         }

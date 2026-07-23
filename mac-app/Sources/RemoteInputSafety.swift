@@ -1,5 +1,63 @@
 import Foundation
 
+enum RemoteHIDReportKind: Hashable {
+    case button
+    case scrollRing
+
+    static func classify(_ bytes: [UInt8]) -> Self {
+        bytes.count == 7 && bytes.first == 0x03 ? .scrollRing : .button
+    }
+}
+
+enum RemoteInputDisposition: Equatable {
+    case accepted
+    case blockedBack
+}
+
+enum RemoteInputGuard {
+    /// TV 是现场确认不会自发触发的唯一删除入口。
+    static let deleteUsage: UInt8 = 0x35
+    /// Home 在圆盘噪声中出现过，只允许明确的长按动作。
+    static let homeLongPressDuration: TimeInterval = 3.0
+    /// OK 在圆盘噪声中出现过，只允许明确的长按确认。
+    static let confirmLongPressDuration: TimeInterval = 2.0
+    /// Menu 也不接受短脉冲，只允许明确的长按映射。
+    static let menuLongPressDuration: TimeInterval = 2.0
+    /// 方向键必须保持 80ms：低于用户实测最短自然按压 91ms，同时过滤短促噪声。
+    static let directionHoldDuration: TimeInterval = 0.08
+    /// Back 在该遥控器上有明确的自发噪声记录，不允许进入任何映射或删除路径。
+    static func disposition(for usage: UInt8) -> RemoteInputDisposition {
+        usage == 0xF1 ? .blockedBack : .accepted
+    }
+}
+
+struct RemoteInputStatistics {
+    private var reports: [RemoteHIDReportKind: Int] = [:]
+    private var acceptedUsages: [UInt8: Int] = [:]
+    private(set) var blockedBackCount = 0
+
+    mutating func recordReport(_ kind: RemoteHIDReportKind) {
+        reports[kind, default: 0] += 1
+    }
+
+    mutating func recordDisposition(_ disposition: RemoteInputDisposition, usage: UInt8) {
+        switch disposition {
+        case .accepted:
+            guard usage != 0 else { return }
+            acceptedUsages[usage, default: 0] += 1
+        case .blockedBack:
+            blockedBackCount += 1
+        }
+    }
+
+    func reportCount(for kind: RemoteHIDReportKind) -> Int { reports[kind, default: 0] }
+    func acceptedCount(for usage: UInt8) -> Int { acceptedUsages[usage, default: 0] }
+
+    var summary: String {
+        "报告：按键 \(reportCount(for: .button)) · 圆盘 \(reportCount(for: .scrollRing))；拦截 Back \(blockedBackCount)"
+    }
+}
+
 enum RemoteDeviceFilter {
     static let supportedVIDs: Set<Int> = [0x2717, 0x17EF]
     static func isEligible(vid: Int, pid: Int, product: String) -> Bool {
