@@ -256,9 +256,26 @@ final class Engine: ObservableObject {
     private var ringDecoder = RingScrollDecoder()
     // 圆盘开关：默认关闭（防误触）。用户在 UI 开启后才解码滚动事件。
     @Published var ringEnabled: Bool = UserDefaults.standard.bool(forKey: "ringEnabled")
-    // HID 诊断模式：开启时记录所有报告原始字节，排查"静置自发误触"。默认开启用于本次诊断。
-    @Published var hidDiagMode: Bool = true
+    // HID 诊断模式：开启时记录所有原始字节。默认关闭，避免圆盘噪声刷满日志；统计始终开启。
+    @Published var hidDiagMode: Bool = false
+    @Published private(set) var inputSafetySummary = "报告：按键 0 · 圆盘 0；拦截 Back 0"
+    private var inputStatistics = RemoteInputStatistics()
+    private var nextInputSafetySummaryAt: TimeInterval = 0
     func setHidDiagMode(_ on: Bool) { hidDiagMode = on; L(on ? "🔬 HID 诊断已开启" : "HID 诊断已关闭") }
+    private func recordReport(_ kind: RemoteHIDReportKind) {
+        inputStatistics.recordReport(kind)
+        refreshInputSafetySummaryIfNeeded()
+    }
+    private func recordDisposition(_ disposition: RemoteInputDisposition, usage: UInt8) {
+        inputStatistics.recordDisposition(disposition, usage: usage)
+        refreshInputSafetySummaryIfNeeded(force: disposition == .blockedBack)
+    }
+    private func refreshInputSafetySummaryIfNeeded(force: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now >= nextInputSafetySummaryAt else { return }
+        nextInputSafetySummaryAt = now + 0.5
+        inputSafetySummary = inputStatistics.summary
+    }
     func setRingEnabled(_ on: Bool) {
         guard ringEnabled != on else { return }
         ringEnabled = on
@@ -329,6 +346,7 @@ final class Engine: ObservableObject {
     private var pendingDirectionUsage: Int = 0
     private var pendingDirectionMapping: ButtonMapping?
     private var pendingDirectionTimer: Timer?
+    private var pendingDirectionDownAt: TimeInterval = 0
     // 抖动检测：拿起遥控器/手指碰圆环时会产生密集且多变的 usage 切换（0xF1/0x28/0x51 混跳），
     // 真实按键是单一 usage 持续保持。记录近期（200ms 内）出现的不同 usage 集合，
     // 若短时间内切换 ≥3 种不同 usage，判定为抖动，忽略这批脉冲，避免误删除。
@@ -387,6 +405,7 @@ final class Engine: ObservableObject {
         started = true
         proxy = BTProxy(self)
         btProxyRef = proxy   // 额外强引用
+        enforceInputSafetyMappings()
         ConfigStore.save(config)
         L("语音键映射: \(config.voice.display)")
         applyVoiceGlobeMapping()
@@ -423,6 +442,13 @@ final class Engine: ObservableObject {
                 self.checkAutoSleep()
             }
         }
+    }
+
+    /// 迁移旧配置：Home 从即时打开备忘录收紧为 3 秒长按，避免圆盘噪声误启动应用。
+    private func enforceInputSafetyMappings() {
+        guard let home = config.buttons.firstIndex(where: { $0.usage == 0x4A }) else { return }
+        config.buttons[home].keycode = KeyNames.kNone
+        config.buttons[home].longPressKeycode = KeyNames.kOpenNotes
     }
 
     /// TCC permission requests are deliberately made at most once for a fresh
@@ -1575,20 +1601,11 @@ final class Engine: ObservableObject {
             let fmt = bytes.count == 7 && bytes[0] == 0x01 ? "01格式" : (bytes.count == 7 && bytes[0] == 0x03 ? "03格式" : "其他")
             L("🔬HID原始[\(fmt) \(bytes.count)字节]: \(hex)")
         }
-        let known = Set(config.buttons.map { UInt8(truncatingIfNeeded: $0.usage) } + [HIDMap.voiceUsage])
-        // 先尝试解析已知 usage——即使报告来自鼠标/指针通道，若内含已知按键也优先识别。
-        if let usage = XiaomiRemoteHIDParser.usage(in: bytes, known: known) {
-            hidReport(usage: usage)
-            return
-        }
-        if XiaomiRemoteHIDParser.isRelease(bytes) {
-            hidReport(usage: 0)
-            return
-        }
-        // Pro 圆盘（类 AirPods 滚轮）转动会发 ReportID=0x03 的 7 字节报告。
-        // 接 RingScrollDecoder：连续 ≥3 帧、间隔 ≤80ms、同一字节位同方向，才发有界滚动；
-        // 否则视为静置/不稳噪声，忽略。校准失败时保持静默（安全优先）。
-        if bytes.count == 7 && bytes[0] == 0x03 {
+        let reportKind = RemoteHIDReportKind.classify(bytes)
+        recordReport(reportKind)
+        // 圆盘 ReportID=0x03 的位移字节可能恰好等于 0x28/方向键 usage。
+        // 必须在通用 usage 扫描前分流，否则会被误派发为按键。
+        if reportKind == .scrollRing {
             // 圆盘默认关闭（防误触）。用户在 UI 开启后才解码滚动；关闭时直接静默丢弃。
             guard ringEnabled else { return }
             let now = ProcessInfo.processInfo.systemUptime
@@ -1601,6 +1618,16 @@ final class Engine: ObservableObject {
                 ringLearningBuffer.append((bytes: bytes, at: now))
                 L("🗃圆盘帧: \(hex)（未达稳定阈值，忽略）")
             }
+            return
+        }
+        let known = Set(config.buttons.map { UInt8(truncatingIfNeeded: $0.usage) } + [HIDMap.voiceUsage])
+        // 先尝试解析已知 usage——即使报告来自鼠标/指针通道，若内含已知按键也优先识别。
+        if let usage = XiaomiRemoteHIDParser.usage(in: bytes, known: known) {
+            hidReport(usage: usage)
+            return
+        }
+        if XiaomiRemoteHIDParser.isRelease(bytes) {
+            hidReport(usage: 0)
             return
         }
         // Pro 圆环转动会发密集的键盘数组报告（ReportID=0x01，10 字节，主键 [3] 是字母/数字
@@ -1616,15 +1643,25 @@ final class Engine: ObservableObject {
 
     private func hidReport(usage: UInt8) {
         let now = ProcessInfo.processInfo.systemUptime
+        if usage != 0 {
+            let disposition = RemoteInputGuard.disposition(for: usage)
+            recordDisposition(disposition, usage: usage)
+            if disposition == .blockedBack {
+                // 分支 59268b0 已验证 Back(0xF1) 会在静置时自发出现；它不再参与任何映射。
+                L("🛡 Back(0xF1) 已统一过滤，不执行任何动作")
+                return
+            }
+        }
         if usage == 0x00 {
             longPressTimer?.invalidate(); longPressTimer = nil
             deleteRepeatTimer?.invalidate(); deleteRepeatTimer = nil
-            // 方向键延迟确认取消：若 pendingDirection 还未触发（<40ms 就 release），视为抖动脉冲，
+            // 方向键延迟确认取消：若 pendingDirection 还未触发（<80ms 就 release），视为抖动脉冲，
             // 不发送 key-down，也不发 key-up（彻底静默），过滤拿起误触。
             if pendingDirectionUsage != 0 {
-                L("方向/OK 短脉冲（<40ms），视为抖动忽略")
+                let heldMs = Int((now - pendingDirectionDownAt) * 1000)
+                L("方向键采样: 0x\(String(format: "%02X", pendingDirectionUsage)) 按住 \(heldMs)ms（<80ms，未执行）")
                 pendingDirectionTimer?.invalidate(); pendingDirectionTimer = nil
-                pendingDirectionUsage = 0; pendingDirectionMapping = nil
+                pendingDirectionUsage = 0; pendingDirectionMapping = nil; pendingDirectionDownAt = 0
                 downButtonUsage = 0; downTarget = nil; longPressFired = false
                 recentUsages.removeAll()
                 return
@@ -1646,8 +1683,12 @@ final class Engine: ObservableObject {
                     if !longPressFired { tapMapping(t) }
                 } else if t.keycode >= KeyNames.kSpecialBase { stopSpecial(t.keycode) }
                 else if t.keycode != KeyNames.kNone { postKey(CGKeyCode(t.keycode), down: false, cmd: false) }
+                if [0x52, 0x51, 0x50, 0x4F].contains(t.usage), pendingDirectionDownAt > 0 {
+                    let heldMs = Int((now - pendingDirectionDownAt) * 1000)
+                    L("方向键采样: 0x\(String(format: "%02X", t.usage)) 按住 \(heldMs)ms（已执行）")
+                }
             }
-            downButtonUsage = 0; downTarget = nil; longPressFired = false
+            downButtonUsage = 0; downTarget = nil; longPressFired = false; pendingDirectionDownAt = 0
             return
         }
         if usage == HIDMap.voiceUsage {
@@ -1697,11 +1738,15 @@ final class Engine: ObservableObject {
         let msg = String(format: "0x%02x [%@] → %@", usage, m.name, m.display)
         L(msg)
         self.flashKey(label: m.name, mapping: m.display)
-        // TV 键(0x35) 唤醒：静置时不自发（已验证），是可靠的"用户在场"信号。
-        // 按下 TV 键即唤醒遥控器（解除休眠态），TV 键本身不触发其他动作。
-        if Int(usage) == 0x35 {
+        // TV 键静置时不自发，作为唯一删除入口：按下删除一个字符，同时续期唤醒。
+        // Back 已无条件过滤；OK 保持确认键，避免删除和确认互相误伤。
+        if usage == RemoteInputGuard.deleteUsage {
             wakeByTVKey()
+            postKey(0x33, down: true, cmd: false)
+            postKey(0x33, down: false, cmd: false)
             downButtonUsage = Int(usage); downTarget = nil
+            L("TV(删除) 单击删除 1 字")
+            flashKey(label: "TV 键", mapping: "删除 1 字")
             return
         }
         if m.keycode == KeyNames.kNone { downButtonUsage = Int(usage); downTarget = nil; return }
@@ -1724,18 +1769,52 @@ final class Engine: ObservableObject {
             L("Back(删除) 单击删除 1 字")
             return
         }
-        // 方向键/OK/Menu 等普通按键：延迟 40ms 确认，过滤 <40ms 的抖动脉冲（拿起误触）。
-        // 40ms 延迟人几乎无感，但足以滤掉抖动产生的孤立短脉冲。release 在 40ms 内到来则取消。
-        if Int(usage) == 0x28 || Int(usage) == 0x52 || Int(usage) == 0x51
+        if Int(usage) == 0x28 {
+            // OK 只有持续 2 秒才发一次当前映射（默认 Return）；短按/噪声不产生任何动作。
+            var gatedMapping = m
+            gatedMapping.keycode = KeyNames.kNone
+            gatedMapping.longPressKeycode = m.keycode
+            downButtonUsage = Int(usage); downTarget = gatedMapping; longPressFired = false
+            longPressTimer?.invalidate()
+            longPressTimer = Timer.scheduledTimer(withTimeInterval: RemoteInputGuard.confirmLongPressDuration, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self = self, self.downButtonUsage == Int(usage) else { return }
+                    self.longPressFired = true
+                    self.tapMapping(m)
+                    self.flashKey(label: "长按 OK", mapping: m.display)
+                }
+            }
+            return
+        }
+        if Int(usage) == 0x65 {
+            // Menu 只有持续 2 秒才发一次当前映射（默认 Esc）；短按/噪声不产生任何动作。
+            var gatedMapping = m
+            gatedMapping.keycode = KeyNames.kNone
+            gatedMapping.longPressKeycode = m.keycode
+            downButtonUsage = Int(usage); downTarget = gatedMapping; longPressFired = false
+            longPressTimer?.invalidate()
+            longPressTimer = Timer.scheduledTimer(withTimeInterval: RemoteInputGuard.menuLongPressDuration, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self = self, self.downButtonUsage == Int(usage) else { return }
+                    self.longPressFired = true
+                    self.tapMapping(m)
+                    self.flashKey(label: "长按 Menu", mapping: m.display)
+                }
+            }
+            return
+        }
+        // 方向键必须持续 80ms 才确认；阈值来自用户实测短按分布。
+        if Int(usage) == 0x52 || Int(usage) == 0x51
             || Int(usage) == 0x50 || Int(usage) == 0x4F {
             pendingDirectionUsage = Int(usage)
             pendingDirectionMapping = m
+            pendingDirectionDownAt = now
             downButtonUsage = Int(usage)   // 标记为按下，防止 HID 重复 down 干扰
             pendingDirectionTimer?.invalidate()
-            pendingDirectionTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: false) { [weak self] _ in
+            pendingDirectionTimer = Timer.scheduledTimer(withTimeInterval: RemoteInputGuard.directionHoldDuration, repeats: false) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     guard let self = self, self.pendingDirectionUsage == Int(usage) else { return }
-                    // 40ms 内没收到 release，确认是真实按压，发送 key-down
+                    // 80ms 内没收到 release，确认是真实按压，发送 key-down
                     if let pm = self.pendingDirectionMapping {
                         self.downTarget = pm
                         if pm.keycode >= KeyNames.kSpecialBase { self.startSpecial(pm.keycode) }
@@ -1744,6 +1823,20 @@ final class Engine: ObservableObject {
                     self.pendingDirectionUsage = 0
                     self.pendingDirectionMapping = nil
                     self.pendingDirectionTimer = nil
+                }
+            }
+            return
+        }
+        if Int(usage) == 0x4A {
+            // Home 只有持续 3 秒才打开备忘录；短按/噪声 release 不产生任何动作。
+            downButtonUsage = Int(usage); downTarget = m; longPressFired = false
+            longPressTimer?.invalidate()
+            longPressTimer = Timer.scheduledTimer(withTimeInterval: RemoteInputGuard.homeLongPressDuration, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self = self, self.downButtonUsage == Int(usage) else { return }
+                    self.longPressFired = true
+                    self.trigger(keycode: KeyNames.kOpenNotes, mapping: m, down: true)
+                    self.flashKey(label: "长按 Home", mapping: "打开备忘录")
                 }
             }
             return

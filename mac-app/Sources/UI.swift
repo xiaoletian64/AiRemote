@@ -481,8 +481,11 @@ struct ContentView: View {
 
                 DisclosureGroup("诊断与事件日志", isExpanded: $showDiagnostics) {
                     VStack(alignment: .leading, spacing: 10) {
+                        Text(e.inputSafetySummary)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.orange)
                         HStack {
-                            Text("仅用于排查连接问题") .font(.caption).foregroundStyle(.secondary)
+                            Text("统计始终开启；原始报文日志仅在诊断模式开启时记录") .font(.caption).foregroundStyle(.secondary)
                             Spacer()
                             Button("清空") { e.log.removeAll() }.controlSize(.small)
                         }
