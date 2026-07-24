@@ -37,12 +37,17 @@ pub fn record(log: &Diagnostics, message: impl AsRef<str>) {
 
 fn persist(line: &str) {
     let path = log_path();
-    let Some(parent) = path.parent() else { return; };
+    let Some(parent) = path.parent() else {
+        return;
+    };
     if fs::create_dir_all(parent).is_err() {
         return;
     }
 
-    if fs::metadata(&path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+    if fs::metadata(&path)
+        .map(|m| m.len() > MAX_LOG_BYTES)
+        .unwrap_or(false)
+    {
         let previous = path.with_file_name("diagnostics.previous.log");
         let _ = fs::remove_file(&previous);
         let _ = fs::rename(&path, previous);

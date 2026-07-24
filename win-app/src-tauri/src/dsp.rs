@@ -4,17 +4,32 @@
 /// Biquad 滤波器（Direct Form 1，移植自 Mac 版 Biquad struct）
 #[derive(Clone, Copy)]
 pub struct Biquad {
-    b0: f32, b1: f32, b2: f32,
-    a1: f32, a2: f32,
-    z1: f32, z2: f32,
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
 }
 
 impl Biquad {
     fn new(b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) -> Self {
-        Self { b0, b1, b2, a1, a2, z1: 0.0, z2: 0.0 }
+        Self {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
-    pub fn reset(&mut self) { self.z1 = 0.0; self.z2 = 0.0; }
+    pub fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
 
     pub fn run(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
@@ -85,11 +100,11 @@ impl Biquad {
 
 /// 语音增强 DSP（移植自 Mac 版 VoiceDSP）
 pub struct VoiceDsp {
-    hp: Biquad,          // 高通 160Hz
-    ls: Biquad,          // 低shelf 220Hz -6dB
-    eq1: Biquad,         // 中频 1500Hz +2dB
-    eq2: Biquad,         // 高频 3000Hz +4dB
-    hs: Biquad,          // 高shelf 4000Hz +3dB
+    hp: Biquad,  // 高通 160Hz
+    ls: Biquad,  // 低shelf 220Hz -6dB
+    eq1: Biquad, // 中频 1500Hz +2dB
+    eq2: Biquad, // 高频 3000Hz +4dB
+    hs: Biquad,  // 高shelf 4000Hz +3dB
     env: f32,
     gate: f32,
     gain: f32,
@@ -167,9 +182,13 @@ impl VoiceDsp {
             }
             // 5) 噪声门
             let snr = self.env / self.noise_floor.max(1e-6);
-            let gate_open = if snr > 3.0 { 1.0 }
-                else if snr < 1.5 { 0.02 }
-                else { (snr - 1.5) / 1.5 * 0.98 + 0.02 };
+            let gate_open = if snr > 3.0 {
+                1.0
+            } else if snr < 1.5 {
+                0.02
+            } else {
+                (snr - 1.5) / 1.5 * 0.98 + 0.02
+            };
             let rate = if gate_open > self.gate { 0.05 } else { 0.0008 };
             self.gate += (gate_open - self.gate) * rate;
             x *= self.gate;
