@@ -6,10 +6,10 @@ use std::collections::HashMap;
 /// Windows VK keycode 参考：https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ButtonMapping {
-    pub usage: u16,       // HID usage（0x52=上, 0x28=OK, 0xF1=Back 等）
-    pub name: String,     // 按键名
-    pub vk: u16,          // Windows VK keycode（0xFFFF = 保持原样/不映射）
-    pub special: u32,     // 特殊动作码（0 = 无，>=0x10000 = 特殊动作）
+    pub usage: u16,              // HID usage（0x52=上, 0x28=OK, 0xF1=Back 等）
+    pub name: String,            // 按键名
+    pub vk: u16,                 // Windows VK keycode（0xFFFF = 保持原样/不映射）
+    pub special: u32,            // 特殊动作码（0 = 无，>=0x10000 = 特殊动作）
     pub long_press_special: u32, // 长按特殊动作（0 = 无）
 }
 
@@ -70,23 +70,25 @@ pub mod vk {
     pub const LEFT: u16 = 0x25;
     pub const RIGHT: u16 = 0x27;
     pub const RETURN: u16 = 0x0D;
-    pub const BACK: u16 = 0x08;   // Backspace
+    pub const BACK: u16 = 0x08; // Backspace
     pub const DELETE: u16 = 0x2E;
     pub const ESCAPE: u16 = 0x1B;
     pub const SPACE: u16 = 0x20;
     pub const TAB: u16 = 0x09;
     pub const HOME: u16 = 0x24;
     pub const END: u16 = 0x23;
-    pub const PRIOR: u16 = 0x21;  // PgUp
-    pub const NEXT: u16 = 0x22;   // PgDn
-    // 修饰键
+    pub const PRIOR: u16 = 0x21; // PgUp
+    pub const NEXT: u16 = 0x22; // PgDn
+                                // 修饰键
     pub const SHIFT: u16 = 0x10;
     pub const CONTROL: u16 = 0x11;
     pub const ALT: u16 = 0x12;
     pub const LWIN: u16 = 0x5B;
     pub const RWIN: u16 = 0x5C;
     // 字母 A-Z = 0x41-0x5A
-    pub fn letter(c: char) -> u16 { c.to_ascii_uppercase() as u16 }
+    pub fn letter(c: char) -> u16 {
+        c.to_ascii_uppercase() as u16
+    }
     // 数字 0-9 = 0x30-0x39
 }
 
@@ -98,18 +100,20 @@ pub mod vk {
 /// - MicToggle：按一下切换"转发音频到虚拟麦克风"开关（语音转文字用）
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum VoiceMode {
-    WinH,       // Win+H Windows 语音听写
-    LeftCtrl,   // 左 Ctrl 修饰键
-    LeftWin,    // 左 Win 键
-    CtrlWin,    // Ctrl+Win 组合修饰键
-    WinShift,   // Win+Shift 组合修饰键
-    CtrlShift,  // Ctrl+Shift 组合修饰键
-    AltShift,   // Alt+Shift 组合修饰键（中英文切换）
-    MicToggle,  // 切换虚拟麦克风转发
+    WinH,      // Win+H Windows 语音听写
+    LeftCtrl,  // 左 Ctrl 修饰键
+    LeftWin,   // 左 Win 键
+    CtrlWin,   // Ctrl+Win 组合修饰键
+    WinShift,  // Win+Shift 组合修饰键
+    CtrlShift, // Ctrl+Shift 组合修饰键
+    AltShift,  // Alt+Shift 组合修饰键（中英文切换）
+    MicToggle, // 切换虚拟麦克风转发
 }
 
 impl Default for VoiceMode {
-    fn default() -> Self { VoiceMode::WinH }
+    fn default() -> Self {
+        VoiceMode::WinH
+    }
 }
 
 impl VoiceMode {
@@ -162,16 +166,19 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let buttons = KNOWN_BUTTONS.iter().map(|(usage, name)| {
-            let (vk, special, long_press) = default_mapping(*usage);
-            ButtonMapping {
-                usage: *usage,
-                name: name.to_string(),
-                vk,
-                special,
-                long_press_special: long_press,
-            }
-        }).collect();
+        let buttons = KNOWN_BUTTONS
+            .iter()
+            .map(|(usage, name)| {
+                let (vk, special, long_press) = default_mapping(*usage);
+                ButtonMapping {
+                    usage: *usage,
+                    name: name.to_string(),
+                    vk,
+                    special,
+                    long_press_special: long_press,
+                }
+            })
+            .collect();
         Config {
             buttons,
             voice_enabled: true,
@@ -184,18 +191,18 @@ impl Default for Config {
 /// 默认映射（usage → (vk, special, long_press_special)）
 fn default_mapping(usage: u16) -> (u16, u32, u32) {
     match usage {
-        0x52 => (vk::UP, 0, 0),           // 上
-        0x51 => (vk::DOWN, 0, 0),         // 下
-        0x50 => (vk::LEFT, 0, 0),         // 左
-        0x4F => (vk::RIGHT, 0, 0),        // 右
-        0x28 => (vk::RETURN, 0, 0),       // OK → Enter
-        0xF1 => (vk::BACK, 0, 0),         // Back → Backspace（长按变速删除）
+        0x52 => (vk::UP, 0, 0),                                     // 上
+        0x51 => (vk::DOWN, 0, 0),                                   // 下
+        0x50 => (vk::LEFT, 0, 0),                                   // 左
+        0x4F => (vk::RIGHT, 0, 0),                                  // 右
+        0x28 => (vk::RETURN, 0, 0),                                 // OK → Enter
+        0xF1 => (vk::BACK, 0, 0), // Back → Backspace（长按变速删除）
         0x4A => (0, SPECIAL_OPEN_NOTEPAD, 0), // Home → 打开记事本
         0x65 => (vk::ESCAPE, 0, SPECIAL_INTERRUPT), // Menu → Esc / 长按 Ctrl+C
         0x66 => (0, SPECIAL_LOCK_SCREEN, SPECIAL_SHUTDOWN_CONFIRM), // Power → 锁屏/关机
-        0x80 => (0xAF, 0, 0),          // Volume Up → VK_VOLUME_UP
-        0x81 => (0xAE, 0, 0),          // Volume Down → VK_VOLUME_DOWN
-        _ => (VK_NONE, 0, 0),             // 其他保持原样
+        0x80 => (0xAF, 0, 0),     // Volume Up → VK_VOLUME_UP
+        0x81 => (0xAE, 0, 0),     // Volume Down → VK_VOLUME_DOWN
+        _ => (VK_NONE, 0, 0),     // 其他保持原样
     }
 }
 
